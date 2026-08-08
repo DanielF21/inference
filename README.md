@@ -124,18 +124,43 @@ by measurement rather than assumed:
   sides of the roofline, so they are reported separately (TTFT vs
   inter-token latency)
 
+## Measurement integrity
+
+`DecodeTrace.mark()` calls `sync()` after every token, which blocks until the
+GPU drains. That is how inter-token latency is measured, and it could in
+principle inflate every result by preventing the CPU from running ahead.
+
+Measured with `scripts/measure_overhead.py`: **it costs 0.23 ms per forward
+pass, about 1.2%.** Syncing is nearly free here because there is nothing to
+pipeline — at short sequences the CPU is the bottleneck and the GPU is
+already idle, and at long sequences 249 ms of GPU work makes a barrier
+invisible. The instrumentation is not distorting the numbers.
+
 ## Open threads
 
-**Re-run benchmarks without per-token instrumentation.** `DecodeTrace.mark()`
-calls `sync()` after every token, which blocks until the GPU drains. That
-gives accurate inter-token latency but prevents the CPU from running ahead
-into the next step, so overlap is lost across step boundaries — real serving
-engines do not sync in the hot loop. Some unknown fraction of the ~22 ms
-per-pass CPU cost is therefore the measurement itself. Run the same benchmark
-twice, once with per-token marks and once with only start/end timing, and
-report the delta. The instrumentation overhead is a finding worth publishing,
-not hiding, and it needs to be known before any conclusion about host
-overhead is trusted.
+**Explore CUDA graphs to remove per-launch overhead.** A forward pass issues
+**1,123 kernel launches at ~16.5 µs each — 18.5 ms of pure CPU cost**, against
+a 5.1 ms bandwidth floor for a single decode step. At short sequences that
+makes the engine ~96% host-bound: the GPU sits idle waiting to be fed
+(`scripts/measure_overhead.py`).
+
+CUDA graphs capture the launch sequence once and replay it as a single
+submission, so the per-launch API cost mostly disappears. It is an NVIDIA API
+rather than a research idea, and it is standard in vLLM and TensorRT-LLM.
+`torch.compile(mode="reduce-overhead")` is the cheap way in, and adds kernel
+fusion on top.
+
+It cannot be applied yet. Graphs require **static shapes**, and this engine's
+input grows every step (`[1,16] → [1,17] → … → [1,271]`), which would need one
+captured graph per shape. A KV cache makes every decode step `[1,1]`, so the
+cache is a prerequisite rather than an alternative. That is also why real
+engines pad batch sizes into fixed buckets.
+
+Worth revisiting once the cache lands and per-step cost is flat across prompt
+lengths — at that point overhead is the bottleneck everywhere, not just at
+short prompts, and the change has a measured justification.
+
+Read: https://developer.nvidia.com/blog/cuda-graphs/
 
 ## Workload
 

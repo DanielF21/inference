@@ -21,10 +21,11 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
 
-# Fitted from the naive prefill timings: wall clock per forward pass is flat
-# at roughly this value until compute overtakes it. Drawn as a reference line
-# because three of the five prompts sit on it.
-OVERHEAD_FLOOR_MS = 22.0
+# Measured by scripts/measure_overhead.py: a forward pass over a single token,
+# synced only after all repeats. 18.54 ms of it is CPU, so this is the host
+# floor a forward pass cannot go below. Drawn as a reference line because the
+# three shortest prompts sit on it.
+OVERHEAD_FLOOR_MS = 19.32
 
 
 def load(include_warmup: bool = False) -> dict[str, list[dict]]:
@@ -62,11 +63,11 @@ def annotate(ax, xs, ys, fmt: str) -> None:
 
 
 def _overhead_line(ax) -> None:
-    """Reference line for the fitted per-pass host overhead."""
+    """Reference line for the measured per-pass host floor."""
     ax.axhline(OVERHEAD_FLOOR_MS, ls="--", lw=1, color="grey")
-    ax.text(4096, OVERHEAD_FLOOR_MS * 0.93,
-            f"~{OVERHEAD_FLOOR_MS:.0f}ms per-pass host overhead",
-            fontsize=8, color="grey", ha="right", va="top")
+    ax.text(4096, OVERHEAD_FLOOR_MS * 1.02,
+            f"{OVERHEAD_FLOOR_MS:.1f}ms measured host floor",
+            fontsize=8, color="grey", ha="right", va="bottom")
 
 
 def plot_ttft(by_engine: dict[str, list[dict]], out: Path) -> Path:

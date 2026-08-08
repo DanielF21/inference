@@ -85,8 +85,14 @@ def load_model(device_str: str, dtype_str: str):
 
     t0 = perf_counter()
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, local_files_only=True)
+    # Pinned rather than left to the library default. The attention backend
+    # determines whether causally-masked score entries are computed or
+    # skipped, which changes the FLOP count an engine should be credited with.
+    # "sdpa" is the value transformers selected for the naive baseline, so
+    # fixing it here preserves comparability if that default ever moves.
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, dtype=dtype, local_files_only=True
+        MODEL_NAME, dtype=dtype, local_files_only=True,
+        attn_implementation="sdpa",
     )
     model = model.to(device)
     model.eval()

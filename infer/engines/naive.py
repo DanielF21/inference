@@ -29,7 +29,11 @@ class NaiveEngine:
         self.memory = MemoryProbe(self.device)
 
     def describe(self) -> dict[str, str]:
-        return {"kv_cache": "false", "logits_to_keep": "1"}
+        return {
+            "kv_cache": "false",
+            "logits_to_keep": "1",
+            "attn": getattr(self.model.config, "_attn_implementation", "unset"),
+        }
 
     def generate(
         self, prompts: Sequence[str], cfg: SamplingConfig

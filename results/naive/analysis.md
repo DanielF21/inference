@@ -57,21 +57,25 @@ as it becomes slower.
 
 FLOPs are counted as: body `2 × 1.31e9 × Σn` (non-embedding parameters), LM
 head `2 × 0.233e9 × 256` (once per step, because `logits_to_keep=1`), and
-attention `172,032 × Σn²` for `QK^T` and `attn @ V` across all 28 layers.
+attention `86,016 × Σn²` for `QK^T` and `attn @ V` across all 28 layers. The
+attention coefficient is half the full `4 · d · L`: the backend is pinned to
+`sdpa` and receives `attn_mask=None, is_causal=True`, which dispatches to a
+kernel that skips causally-masked entries rather than computing and
+discarding them.
 
 | prompt | total FLOPs | attention share | total time | achieved | MFU |
 |---|---|---|---|---|---|
-| p16 | 97.5 TF | 1.2% | 5.606s | 17.4 TFLOPS | 13.9% |
-| p64 | 130.5 TF | 1.4% | 5.661s | 23.0 TFLOPS | 18.4% |
-| p256 | 264.1 TF | 2.5% | 7.291s | 36.2 TFLOPS | 29.0% |
-| p1024 | 831.3 TF | 7.1% | 18.694s | 44.5 TFLOPS | 35.6% |
-| p4096 | 3619.5 TF | 21.7% | 71.146s | 50.9 TFLOPS | 40.7% |
+| p16 | 97.0 TF | 0.6% | 5.606s | 17.3 TFLOPS | 13.8% |
+| p64 | 129.5 TF | 0.7% | 5.661s | 22.9 TFLOPS | 18.3% |
+| p256 | 260.8 TF | 1.3% | 7.291s | 35.8 TFLOPS | 28.6% |
+| p1024 | 802.0 TF | 3.7% | 18.694s | 42.9 TFLOPS | 34.3% |
+| p4096 | 3226.5 TF | 12.2% | 71.146s | 45.4 TFLOPS | 36.3% |
 
 `achieved = total FLOPs / total time`, and `MFU = achieved / 125 TFLOPS`.
 Time is the only measured quantity in this table; the FLOP counts are derived
 from the architecture (see the full calculation: [MFU Calculation](mfu_calculation.md)).
 
-MFU rises monotonically from 13.9% to 40.7% against the A10's 125 TFLOPS
+MFU rises monotonically from 13.8% to 36.3% against the A10's 125 TFLOPS
 fp16 peak. At short prompts each forward pass is only 16 to (16 + 256) tokens wide so
 the matmuls are small. At p4096 the matmuls are way larger.
 
@@ -89,9 +93,9 @@ through:
 | p256 | 256 → 511 | 0% |
 
 **p256 is the first prompt that is fully compute bound**, which is where
-the MFU curve bends hardest (18.4% → 29.0%).
+the MFU curve bends hardest (18.3% → 28.6%).
 
-Attention's share of total FLOPs grows from 1.2% to 21.7% as context grows,
+Attention's share of total FLOPs grows from 0.6% to 12.2% as context grows,
 which is the quadratic term becoming visible. It is still not dominant at 4K
 for a model this small. The MLP is still the bulk of the work but the trend is
 the reason attention kernels matter at longer contexts.
@@ -140,32 +144,50 @@ Landing well short of that ceiling while staying flat would indicate host and
 kernel launch overhead rather than bandwidth, since a 1.5B model gives each
 step only a few milliseconds of GPU work to hide that overhead behind.
 
+## The overhead floor, measured
+
+The TTFT curve suggests a fixed per pass cost. Prefill is flat across p16,
+p64 and p256 despite 16× more arithmetic. To verify this, I ran `scripts/measure_overhead.py`
+which runs a forward pass over a single token. To allow for the smallest possible amount of GPU work
+so whatever it costs is the fixed cost
+
+| seq_len | pipelined | serialized | cpu only | launches | µs/launch |
+|---|---|---|---|---|---|
+| 1 | 19.32 ms | 19.55 ms | 18.54 ms | 1,123 | 16.5 |
+
+The floor was measured to be 19.32 ms, and 18.54 ms of it is CPU, The GPU contributes
+under a millisecond at seq_len 1. That is ~96% host-bound: I measured 1,123 kernel launches at 16.5 µs each.
+
+- The per token sync in `DecodeTrace` costs 0.23 ms, about 1.2%. It is not
+  distorting the results. The reason is structural — `serialized ≈ pipelined`
+  because there is nothing to pipeline. The CPU is the bottleneck, so the GPU
+  is already idle and a barrier costs nothing. At seq_len 4096 the same
+  equality holds for the opposite reason: 249 ms of GPU work makes a sync
+  invisible.
+
 ## Prediction, recorded before building the cache
 
-The TTFT curve fixes a number that sharpens this. Prefill is flat at ~22 ms
-across p16, p64 and p256 despite 16× more arithmetic, so roughly **22 ms is
-fixed per-pass CPU cost**. The CPU runs in parallel with the GPU, so that
-cost only shows up when it outlasts the GPU work: step time is
-`max(cpu, gpu)`, not their sum.
-
-A cached step has 5.1 ms of GPU work. That is smaller than the 22 ms it would
-need to hide behind, so the cache should land at **~22 ms/step ≈ 45 tok/s,
-flat across every prompt length** — not the 194 tok/s bandwidth ceiling.
+A cached step has ~5.1 ms of GPU work against a 19.32 ms host floor. Step time
+is `max(cpu, gpu)`, since the CPU runs in parallel with the GPU, so the cache
+should land at **~19–20 ms/step ≈ 50 tok/s, flat across every prompt
+length** — not the 194 tok/s bandwidth ceiling.
 
 | prompt | naive | predicted cached | predicted speedup |
 |---|---|---|---|
-| p16 | 45.66 tok/s | ~45 | **~1.0×** |
-| p64 | 45.22 tok/s | ~45 | ~1.0× |
-| p256 | 35.08 tok/s | ~45 | ~1.3× |
-| p1024 | 13.69 tok/s | ~45 | ~3.3× |
-| p4096 | 3.60 tok/s | ~45 | ~12.6× |
+| p16 | 45.66 tok/s | ~52 | ~1.1x |
+| p64 | 45.22 tok/s | ~52 | ~1.2× |
+| p256 | 35.08 tok/s | ~52 | ~1.5× |
+| p1024 | 13.69 tok/s | ~52 | ~3.8× |
+| p4096 | 3.60 tok/s | ~52 | ~14× |
 
-The KV cache will buy essentially nothing at short prompts.
-Naive already runs at 21.9 ms/step at p16. It is sitting on
-the overhead floor, not on a compute limit. Deleting redundant compute cannot
-help where compute was never the constraint. The cache should pay only once
-the recomputation it removes is large enough to have been the binding cost,
-which happens somewhere between p256 and p1024.
+The KV cache will buy essentially nothing at short prompts. Naive already runs
+at 21.9 ms/step at p16, only 13% above the 19.32 ms floor. It is sitting on
+that floor, not on a compute limit, and deleting redundant compute cannot help
+where compute was never the constraint. The cache pays only once the
+recomputation it removes is large enough to have been the binding cost, which
+happens somewhere between p256 and p1024.
 
 If that holds, the bottleneck moves from redundant computation to per step
-host overhead.
+host overhead, and the target after it is already quantified: **1,123 launches
+× 16.5 µs = 18.5 ms of pure launch cost against a 5.1 ms bandwidth floor.
+Removing this overhead is worth more at short prompts than the KV cache is.

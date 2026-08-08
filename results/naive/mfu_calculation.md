@@ -43,6 +43,35 @@ Note `H · d_h = 12 × 128 = 1,536 = d`, and `H_kv · d_h = 2 × 128 = 256`.
 | — | precision | fp16 (2 bytes/value) |
 | — | decoding | greedy, fixed seed |
 
+### G4 — Attention backend
+
+`attn_implementation` is pinned to `sdpa` in `infer/runtime.py`, which is the
+value transformers selected for this baseline before it was pinned.
+
+PyTorch's SDPA is a dispatcher, not an implementation: at each call it selects
+among flash, mem-efficient, and math backends. The first two skip
+causally-masked score entries; math computes the full matrix and masks
+afterwards. Flash and mem-efficient are eligible only when no explicit mask
+tensor is passed and `is_causal=True`
+(`transformers/integrations/sdpa_attention.py`).
+
+Observed arguments at every one of the 28 layers, captured by intercepting
+`scaled_dot_product_attention`:
+
+```
+attn_mask   = None
+is_causal   = True
+enable_gqa  = True
+q_length   == kv_length
+```
+
+This excludes the math backend, so the masked half is skipped. Flash versus
+mem-efficient is not distinguished, and does not need to be — both skip it,
+so the FLOP count is identical either way.
+
+These arguments are chosen by transformers in Python, independent of the
+device, so this holds for the recorded A10 runs.
+
 ---
 
 ## II. Definitions
@@ -189,12 +218,27 @@ FLOPs_attn(n)  =  4 · d_h · H · L · n²  =  4 · d · L · n²  =  172,032 �
 GQA does not reduce this term. There remain `H = 12` query heads producing
 12 distinct score matrices; the `H_kv = 2` key/value heads are broadcast
 across them. GQA reduces storage and memory traffic, not attention
-arithmetic.
+arithmetic. Under `enable_gqa=True` (G4) the broadcast happens inside the
+kernel rather than by materializing an expanded tensor, which saves memory
+traffic but no FLOPs.
+
+**Causal correction.** Position `i` attends only to positions `j ≤ i`, so
+only `(n² + n)/2` of the `n²` score entries are required. The backend in use
+(G4) skips the masked half rather than computing and discarding it, so the
+term is halved:
+
+```
+FLOPs_attn(n)  =  ½ · 4 · d · L · n²  =  86,016 · n²
+```
+
+The residual approximation is tile granularity — blocks straddling the
+diagonal are computed in full. That error is `O(n)` against an `O(n²)` term
+and is negligible at these lengths.
 
 Define:
 
 ```
-A  =  4 · d · L  =  172,032
+A  =  ½ · 4 · d · L  =  86,016
 ```
 
 ### L7 — Summation across the generation loop
@@ -228,7 +272,7 @@ F(P)  =  2·B·Σn  +  2·E·N  +  A·Σn²
           body        head       attention
 ```
 
-with `B = 1,310,340,608`, `E = 233,373,696`, `A = 172,032`, and `Σn`, `Σn²`
+with `B = 1,310,340,608`, `E = 233,373,696`, `A = 86,016`, and `Σn`, `Σn²`
 as given by L7.
 
 By D3 and D4, for a measured wall-clock time `t`:
@@ -258,19 +302,19 @@ MFU  =  F(P) / (t · Π)
 ```
 body  =  2 × 1,310,340,608 × 1,081,216  =  2.8335e15  =  2833.5 TF
 head  =  2 ×   233,373,696 × 256        =  1.1949e11  =     0.1 TF
-attn  =        172,032 × 4,567,913,856  =  7.8580e14  =   785.8 TF
+attn  =         86,016 × 4,567,913,856  =  3.9290e14  =   392.9 TF
                                                         ──────────
-                                             F(4096)  =  3619.5 TF
+                                             F(4096)  =  3226.5 TF
 ```
 
 **Throughput** (D3), with `t = 71.15 s` (mean of 5 recorded runs):
 ```
-R  =  3.6195e15 / 71.15  =  5.087e13  =  50.9 TFLOPS
+R  =  3.2265e15 / 71.15  =  4.535e13  =  45.4 TFLOPS
 ```
 
 **Utilization** (D4):
 ```
-MFU  =  50.9 / 125  =  40.7%
+MFU  =  45.4 / 125  =  36.3%
 ```
 
 ### At P = 16
@@ -281,12 +325,12 @@ MFU  =  50.9 / 125  =  40.7%
 
 body =  2 × 1,310,340,608 × 36,736      =   96.3 TF
 head =                                       0.1 TF
-attn =  172,032 × 6,669,696             =    1.1 TF
+attn =   86,016 × 6,669,696             =    0.6 TF
                                           ─────────
-                               F(16)    =   97.5 TF
+                               F(16)    =   97.0 TF
 
-R    =  9.75e13 / 5.61  =  1.74e13      =  17.4 TFLOPS
-MFU  =  17.4 / 125                      =  13.9%
+R    =  9.70e13 / 5.61  =  1.73e13      =  17.3 TFLOPS
+MFU  =  17.3 / 125                      =  13.8%
 ```
 
 ---
@@ -295,8 +339,8 @@ MFU  =  17.4 / 125                      =  13.9%
 
 | `P` | `Σn` | `Σn²` | body | head | attn | total | `t` | `R` | MFU |
 |---|---|---|---|---|---|---|---|---|---|
-| 16 | 36,736 | 6,669,696 | 96.3 | 0.1 | 1.1 | 97.5 TF | 5.61 s | 17.4 | 13.9% |
-| 64 | 49,024 | 10,786,176 | 128.5 | 0.1 | 1.9 | 130.5 TF | 5.66 s | 23.0 | 18.4% |
-| 256 | 98,176 | 39,048,576 | 257.3 | 0.1 | 6.7 | 264.1 TF | 7.29 s | 36.2 | 29.0% |
-| 1024 | 294,784 | 340,841,856 | 772.5 | 0.1 | 58.6 | 831.3 TF | 18.69 s | 44.5 | 35.6% |
-| 4096 | 1,081,216 | 4,567,913,856 | 2833.5 | 0.1 | 785.8 | 3619.5 TF | 71.15 s | 50.9 | 40.7% |
+| 16 | 36,736 | 6,669,696 | 96.3 | 0.1 | 0.6 | 97.0 TF | 5.61 s | 17.3 | 13.8% |
+| 64 | 49,024 | 10,786,176 | 128.5 | 0.1 | 0.9 | 129.5 TF | 5.66 s | 22.9 | 18.3% |
+| 256 | 98,176 | 39,048,576 | 257.3 | 0.1 | 3.4 | 260.8 TF | 7.29 s | 35.8 | 28.6% |
+| 1024 | 294,784 | 340,841,856 | 772.5 | 0.1 | 29.3 | 802.0 TF | 18.69 s | 42.9 | 34.3% |
+| 4096 | 1,081,216 | 4,567,913,856 | 2833.5 | 0.1 | 392.9 | 3226.5 TF | 71.15 s | 45.4 | 36.3% |
