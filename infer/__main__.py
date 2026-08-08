@@ -22,7 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dtype", default="float16")
     p.add_argument("--runs", type=int, default=5, help="recorded runs per prompt")
     p.add_argument("--warmup", type=int, default=2, help="discarded-from-analysis runs")
-    p.add_argument("--max-new-tokens", type=int, default=128)
+    p.add_argument("--max-new-tokens", type=int, default=256)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
         "--prompts", default="", help="comma-separated labels (default: all)"

@@ -22,7 +22,7 @@ class SamplingConfig:
     rather than sampling randomness.
     """
 
-    max_new_tokens: int = 128
+    max_new_tokens: int = 256
     temperature: float | None = None  # None => greedy argmax
     top_k: int | None = None
     top_p: float | None = None
