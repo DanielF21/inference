@@ -58,6 +58,8 @@ which optimizations are worth building and in what order.
 **NVIDIA A10 on Modal.** Local machines are for the dev loop only; every
 recorded number comes from the A10 so results are comparable across engines.
 
+[Options Considered](modal_chip_analysis.md)
+
 | | |
 |---|---|
 | Memory | 24 GB GDDR6 |
@@ -73,15 +75,21 @@ one advantage is fp8 support, which Ampere lacks.
 
 ## Memory budget
 
+Measured on the A10, not estimated:
+
 | | |
 |---|---|
-| Total | 24 GB |
-| CUDA context + fragmentation | ~1 GB |
-| Model weights (fp16) | 3.09 GB |
-| Activations / workspace | ~1 GB |
-| **Free for KV cache** | **~19 GB** |
+| Card total (nominal) | 24 GB |
+| Visible to CUDA | 22.06 GiB |
+| Model weights (fp16) | 2.88 GiB |
+| Allocator reserved after load | 3.06 GiB |
+| **Free for KV cache** | **~19 GiB** |
 
-19 GB at 28 KiB/token is ~700,000 tokens — around 340 concurrent 2K
+The 2.88 GiB weights figure matches the arithmetic above exactly
+(1.54e9 × 2 bytes). Roughly 0.3 GiB of the card is not visible to CUDA at
+all, and the allocator reserves ~0.2 GiB beyond the weights themselves.
+
+19 GiB at 28 KiB/token is ~710,000 tokens — around 340 concurrent 2K
 sequences. Memory would never bind, so the memory-management work would have
 nothing to show.
 
@@ -133,13 +141,24 @@ infer/
   bench.py       warmup, repeats, CSV + JSONL sinks
   engines/       one file per engine
 scripts/
-  analyze.py     aggregation, cross-engine speedup, output parity
+  analyze.py         aggregation, cross-engine speedup, output parity
+  build_prompts.py   regenerates prompts.py at exact token counts
+modal_app.py         runs a benchmark on an A10, writes results locally
 ```
 
-One row per run is written to `results/runs.csv`; nothing pre-aggregated is
-stored, so raw runs stay recoverable. All aggregation happens in `analyze.py`.
+Results are partitioned by engine:
 
 ```
-uv run python -m infer --engine naive
+results/naive/runs.csv     one row per run, append-only
+results/naive/runs.jsonl   same rows + token_ids, per-token times, text
+```
+
+One row per run, nothing pre-aggregated, so raw runs stay recoverable.
+`analyze.py` globs every engine's directory and pools them, so cross-engine
+comparison needs no extra step.
+
+```
+uv run modal run modal_app.py --engine naive     # recorded runs (A10)
+uv run python -m infer --engine naive            # local dev loop only
 uv run python scripts/analyze.py
 ```

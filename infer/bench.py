@@ -20,8 +20,6 @@ from typing import Any
 from infer.core import Engine, GenerationResult, SamplingConfig
 
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
-CSV_PATH = RESULTS_DIR / "runs.csv"
-JSONL_PATH = RESULTS_DIR / "runs.jsonl"
 
 CSV_FIELDS = [
     # identity
@@ -118,19 +116,32 @@ def _to_row(
     }
 
 
-def _write(rows: list[dict[str, Any]], raw: list[dict[str, Any]]) -> None:
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+def write_results(rows: list[dict[str, Any]], raw: list[dict[str, Any]]) -> Path:
+    """Append to results/<engine>/runs.{csv,jsonl}. Returns the csv path.
 
-    write_header = not CSV_PATH.exists()
-    with CSV_PATH.open("a", newline="") as f:
+    One directory per engine, so a run can never append into another engine's
+    file. Both sinks stay append-only.
+    """
+    engines = {row["engine"] for row in rows}
+    if len(engines) != 1:
+        raise ValueError(f"expected rows from exactly one engine, got {engines}")
+
+    out_dir = RESULTS_DIR / engines.pop()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "runs.csv"
+
+    write_header = not csv_path.exists()
+    with csv_path.open("a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
         if write_header:
             writer.writeheader()
         writer.writerows(rows)
 
-    with JSONL_PATH.open("a") as f:
+    with (out_dir / "runs.jsonl").open("a") as f:
         for record in raw:
             f.write(json.dumps(record) + "\n")
+
+    return csv_path
 
 
 def run_benchmark(
@@ -143,8 +154,12 @@ def run_benchmark(
     runs: int = 5,
     warmup: int = 2,
     batch_size: int = 1,
-) -> list[dict[str, Any]]:
+    write: bool = True,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Benchmark one engine over a set of prompts.
+
+    Returns (rows, raw). With write=False nothing touches disk, so a remote
+    worker can hand the records back to the caller to write.
 
     Warmup runs are recorded with is_warmup=True rather than discarded, so
     the warmup effect can be shown from the data instead of asserted.
@@ -181,6 +196,7 @@ def run_benchmark(
                 f"total={result.total_s:.3f}s decode_tps={result.decode_tps:.2f}"
             )
 
-    _write(rows, raw)
-    print(f"[bench] wrote {len(rows)} rows -> {CSV_PATH}")
-    return rows
+    if write:
+        path = write_results(rows, raw)
+        print(f"[bench] wrote {len(rows)} rows -> {path}")
+    return rows, raw

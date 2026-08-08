@@ -1,4 +1,4 @@
-# Modal GPU candidates — specs
+# Modal GPU candidates
 
 All FLOPS figures are **dense** (no structured sparsity).
 

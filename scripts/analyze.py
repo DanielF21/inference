@@ -17,15 +17,20 @@ from collections import defaultdict
 from pathlib import Path
 
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
-CSV_PATH = RESULTS_DIR / "runs.csv"
-JSONL_PATH = RESULTS_DIR / "runs.jsonl"
 
 
 def load_rows(include_warmup: bool = False) -> list[dict]:
-    if not CSV_PATH.exists():
-        raise SystemExit(f"no results at {CSV_PATH} — run `python -m infer` first")
-    with CSV_PATH.open() as f:
-        rows = list(csv.DictReader(f))
+    """Pool every engine's results/<engine>/runs.csv into one list."""
+    paths = sorted(RESULTS_DIR.glob("*/runs.csv"))
+    if not paths:
+        raise SystemExit(
+            f"no results under {RESULTS_DIR}/*/runs.csv — run a benchmark first"
+        )
+
+    rows: list[dict] = []
+    for path in paths:
+        with path.open() as f:
+            rows.extend(csv.DictReader(f))
     if not include_warmup:
         rows = [r for r in rows if r["is_warmup"] != "True"]
     return rows
@@ -44,7 +49,8 @@ def summarize(rows: list[dict]) -> None:
 
     header = (
         f"{'engine':<10} {'prompt':<14} {'ptok':>5} {'n':>3} "
-        f"{'ttft_med':>9} {'decode_tps':>11} {'e2e_tps':>9} {'itl_p95':>9}"
+        f"{'ttft_med':>9} {'total_mean':>11} {'decode_tps':>11} {'e2e_tps':>9} "
+        f"{'itl_p95':>9}"
     )
     print(header)
     print("-" * len(header))
@@ -58,9 +64,13 @@ def summarize(rows: list[dict]) -> None:
         ttft_med = statistics.median(float(r["ttft_s"]) for r in group)
         itl_p95 = [float(r["itl_p95_ms"]) for r in group if r["itl_p95_ms"]]
 
+        # Mean wall-clock per run: the denominator for FLOPs-based utilization,
+        # which needs a per-run duration rather than a rate.
+        total_mean = total_time / len(group)
+
         print(
             f"{engine:<10} {prompt:<14} {int(group[0]['prompt_tokens']):>5} {len(group):>3} "
-            f"{ttft_med:>8.3f}s {decode_tokens / decode_time:>11.2f} "
+            f"{ttft_med:>8.3f}s {total_mean:>10.3f}s {decode_tokens / decode_time:>11.2f} "
             f"{total_tokens / total_time:>9.2f} "
             f"{(statistics.median(itl_p95) if itl_p95 else float('nan')):>8.1f}ms"
         )
@@ -101,16 +111,18 @@ def parity(engine_a: str, engine_b: str) -> None:
     First-divergence rather than pass/fail: fp16 with different kernel shapes
     drifts eventually, and where it drifts is the useful signal.
     """
-    if not JSONL_PATH.exists():
-        raise SystemExit(f"no raw records at {JSONL_PATH}")
+    paths = sorted(RESULTS_DIR.glob("*/runs.jsonl"))
+    if not paths:
+        raise SystemExit(f"no raw records under {RESULTS_DIR}/*/runs.jsonl")
 
     latest: dict[tuple[str, str], list[int]] = {}
-    with JSONL_PATH.open() as f:
-        for line in f:
-            rec = json.loads(line)
-            if rec["is_warmup"] or rec["temperature"] not in ("", None):
-                continue  # parity is only meaningful under greedy
-            latest[(rec["engine"], rec["prompt_label"])] = rec["token_ids"]
+    for path in paths:
+        with path.open() as f:
+            for line in f:
+                rec = json.loads(line)
+                if rec["is_warmup"] or rec["temperature"] not in ("", None):
+                    continue  # parity is only meaningful under greedy
+                latest[(rec["engine"], rec["prompt_label"])] = rec["token_ids"]
 
     prompts = sorted({p for (e, p) in latest if e == engine_a})
     if not prompts:
