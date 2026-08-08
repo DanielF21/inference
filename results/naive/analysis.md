@@ -139,3 +139,33 @@ or roughly 194 tok/s, against the 277.9 ms per step measured here at p4096.
 Landing well short of that ceiling while staying flat would indicate host and
 kernel launch overhead rather than bandwidth, since a 1.5B model gives each
 step only a few milliseconds of GPU work to hide that overhead behind.
+
+## Prediction, recorded before building the cache
+
+The TTFT curve fixes a number that sharpens this. Prefill is flat at ~22 ms
+across p16, p64 and p256 despite 16× more arithmetic, so roughly **22 ms is
+fixed per-pass CPU cost**. The CPU runs in parallel with the GPU, so that
+cost only shows up when it outlasts the GPU work: step time is
+`max(cpu, gpu)`, not their sum.
+
+A cached step has 5.1 ms of GPU work. That is smaller than the 22 ms it would
+need to hide behind, so the cache should land at **~22 ms/step ≈ 45 tok/s,
+flat across every prompt length** — not the 194 tok/s bandwidth ceiling.
+
+| prompt | naive | predicted cached | predicted speedup |
+|---|---|---|---|
+| p16 | 45.66 tok/s | ~45 | **~1.0×** |
+| p64 | 45.22 tok/s | ~45 | ~1.0× |
+| p256 | 35.08 tok/s | ~45 | ~1.3× |
+| p1024 | 13.69 tok/s | ~45 | ~3.3× |
+| p4096 | 3.60 tok/s | ~45 | ~12.6× |
+
+The KV cache will buy essentially nothing at short prompts.
+Naive already runs at 21.9 ms/step at p16. It is sitting on
+the overhead floor, not on a compute limit. Deleting redundant compute cannot
+help where compute was never the constraint. The cache should pay only once
+the recomputation it removes is large enough to have been the binding cost,
+which happens somewhere between p256 and p1024.
+
+If that holds, the bottleneck moves from redundant computation to per step
+host overhead.

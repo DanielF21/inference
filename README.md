@@ -124,6 +124,19 @@ by measurement rather than assumed:
   sides of the roofline, so they are reported separately (TTFT vs
   inter-token latency)
 
+## Open threads
+
+**Re-run benchmarks without per-token instrumentation.** `DecodeTrace.mark()`
+calls `sync()` after every token, which blocks until the GPU drains. That
+gives accurate inter-token latency but prevents the CPU from running ahead
+into the next step, so overlap is lost across step boundaries — real serving
+engines do not sync in the hot loop. Some unknown fraction of the ~22 ms
+per-pass CPU cost is therefore the measurement itself. Run the same benchmark
+twice, once with per-token marks and once with only start/end timing, and
+report the delta. The instrumentation overhead is a finding worth publishing,
+not hiding, and it needs to be known before any conclusion about host
+overhead is trusted.
+
 ## Workload
 
 Prompts are sliced to exact token counts (16 / 64 / 256 / 1024 / 4096) from a
