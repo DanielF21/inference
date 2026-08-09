@@ -40,11 +40,8 @@ Step `i` processes `P + i` tokens, so a full generation costs
 
 The constant 32,640 comes from the generated tokens alone. 
 
-$$
-\sum_{i=0}^{255} i = \frac{(N - 1)N}{2} = \frac{255 \times 256}{2} = 32{,}640
-$$
-and dominates until
-`256·P` becomes comparable to it — around P = 128. Below that, the prompt is
+Σ(0, 1, ..., 255) = (N - 1) * N / 2 = 255 * 256 / 2 = 32,640 and dominates until
+`256·P` becomes comparable to it which is around P = 128. Below that, the prompt is
 nearly irrelevant and the cost is essentially fixed. Above it, the curve
 bends sharply. The same reasoning explains why `ttft` is flat at 16, 64 and
 256 tokens: prefill at those lengths is fixed overhead bound, not
@@ -60,7 +57,7 @@ head `2 × 0.233e9 × 256` (once per step, because `logits_to_keep=1`), and
 attention `86,016 × Σn²` for `QK^T` and `attn @ V` across all 28 layers. The
 attention coefficient is half the full `4 · d · L`: the backend is pinned to
 `sdpa` and receives `attn_mask=None, is_causal=True`, which dispatches to a
-kernel that skips causally-masked entries rather than computing and
+kernel that skips causally masked entries rather than computing and
 discarding them.
 
 | prompt | total FLOPs | attention share | total time | achieved | MFU |
@@ -115,7 +112,7 @@ invariant.
 
 Peak allocated memory barely moves: 2.90 GiB at p16 to 3.16 GiB at p4096,
 against 2.88 GiB of weights. Everything above the weights is transient
-activation memory, and nothing persists between steps — which is precisely
+activation memory, and nothing persists between steps which is precisely
 the trade being made. The naive engine spends compute to avoid holding state.
 
 Memory is measured with `torch.cuda.max_memory_allocated()`, a true peak
@@ -124,7 +121,7 @@ rather than a sampled proxy.
 ## Bottleneck, and what follows
 
 The binding constraint is redundant computation, not bandwidth, not capacity,
-not kernel quality. Nothing about memory is under pressure — 19 GiB of the
+not kernel quality. Nothing about memory is under pressure. 19 GiB of the
 card sits unused.
 
 Removing the recomputation is the next change, and it makes two falsifiable
@@ -134,7 +131,7 @@ predictions:
    reads the same 2.88 GiB of weights regardless of context, with only a
    small additional term for reading the cache. Where naive falls 12.7×
    across the prompt range, cached should barely move.
-2. **The speedup is a curve, not a number** — small at p16, large at p4096.
+2. **The speedup is a curve, not a number**: small at p16, large at p4096.
    Reporting a single "Nx faster" figure for this change would be
    meaningless without stating the sequence length it was measured at.
 
