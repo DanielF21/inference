@@ -25,9 +25,6 @@ class CachedEngine:
         self.memory = MemoryProbe(self.device)
 
     def describe(self) -> dict[str, str]:
-        # Pool size isn't recorded here — it depends on SamplingConfig, which
-        # describe() never sees. prompt_tokens and max_new_tokens are already
-        # their own CSV columns, so it stays recoverable per row.
         return {
             "kv_cache": "true",
             "cache_layout": "preallocated_contiguous",
@@ -47,8 +44,7 @@ class CachedEngine:
         ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
         prompt_tokens = ids.shape[-1]
 
-        # Everything the run can possibly need: the prompt plus every token it
-        # is allowed to generate.
+        # The prompt size + the most tokens it can generate
         max_len = prompt_tokens + cfg.max_new_tokens
 
         # Layer for each attention layer
@@ -67,7 +63,7 @@ class CachedEngine:
 
         if cfg.stop_on_eos and next_id.item() == self.tokenizer.eos_token_id:
             stopped_reason = "eos"
-        # Prefill already emitted one token, so decode owes n-1 — and none at
+        # Prefill already emitted one token, so decode owes n-1 and none at
         # all if prefill itself produced EOS.
         remaining = 0 if stopped_reason == "eos" else cfg.max_new_tokens - 1
 
