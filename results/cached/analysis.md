@@ -115,7 +115,7 @@ and the cache is read in full each decode step Nothing here observes actual DRAM
 | 1024 | 3036.0 MiB | 3054.4 MiB | +18.5 | 35.0 MiB |
 | 4096 | 3231.3 MiB | 3332.5 MiB | +101.1 | 119.0 MiB |
 
-`cache size` is `(P + 256) x 28 KiB` from the [README's per token arithmetic](../README.md#memory-arithmetic).
+`cache size` is `(P + 256) x 28 KiB` from the [README's per token arithmetic](../../README.md#memory-arithmetic).
 Cached is cheaper than naive at short prompts and more expensive at long ones,
 crossing over between p256 and p1024.
 
