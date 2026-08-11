@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from infer.core import Engine, EngineConfig
 
-ENGINE_NAMES = ("naive", "cached",)
+ENGINE_NAMES = ("naive", "cached", "batched",)
 
 
 def build_engine(name: str, cfg: EngineConfig) -> Engine:
@@ -23,4 +23,8 @@ def build_engine(name: str, cfg: EngineConfig) -> Engine:
         from infer.engines.cached.engine import CachedEngine
 
         return CachedEngine(cfg)
+    elif name == "batched":
+        from infer.engines.batched.engine import BatchedEngine
+
+        return BatchedEngine(cfg)
     raise ValueError(f"unknown engine {name!r}; expected one of {ENGINE_NAMES}")
