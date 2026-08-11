@@ -32,6 +32,20 @@ class SamplingConfig:
 
 
 @dataclass(frozen=True)
+class Request:
+    """One prompt and the budget it is allowed to spend.
+
+    SamplingConfig.max_new_tokens is one number for a whole call, so it cannot
+    express a batch whose rows stop at different steps. That unevenness is what
+    makes a static batch keep computing rows that are already done, which is
+    the cost this engine exists to measure.
+    """
+
+    prompt: str
+    max_new_tokens: int
+
+
+@dataclass(frozen=True)
 class EngineConfig:
     """Where the engine runs."""
 

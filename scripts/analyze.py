@@ -168,7 +168,9 @@ def padding(rows: list[dict]) -> None:
     groups: dict[tuple[str, str, int], list[tuple[int, int, int]]] = defaultdict(list)
     for group in batches.values():
         head = group[0]
-        budget = int(head["max_new_tokens"])
+        # The batch runs to its longest budget and the cache is sized for it,
+        # so every row's reservation is the max, not its own.
+        budget = max(int(r["max_new_tokens"]) for r in group)
         width = max(int(r["prompt_tokens"]) for r in group)
         reserved = len(group) * (width + budget)
         pad = len(group) * width - sum(int(r["prompt_tokens"]) for r in group)

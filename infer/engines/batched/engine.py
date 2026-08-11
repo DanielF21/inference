@@ -21,6 +21,7 @@ from infer.core import (
     EngineConfig,
     GenerationResult,
     PoolExhausted,
+    Request,
     SamplingConfig,
 )
 from infer.engines.batched.cache import BatchedCacheLayer
@@ -71,18 +72,29 @@ class BatchedEngine:
     def generate(
         self, prompts: Sequence[str], cfg: SamplingConfig
     ) -> list[GenerationResult]:
-        """Every prompt rides through one batch, unlike the engines before this
-        one, which looped. At the one prompt the benchmark harness passes today
-        the two are the same call."""
-        return self.generate_batch(prompts, cfg)
+        """The Engine protocol: every prompt rides through one batch, unlike
+        the engines before this one, which looped. Each gets the same budget,
+        so this is the uniform workload. generate_batch takes per-row budgets.
+        """
+        return self.generate_batch(
+            [Request(p, cfg.max_new_tokens) for p in prompts], cfg
+        )
 
     @torch.no_grad()
     def generate_batch(
-        self, prompts: Sequence[str], cfg: SamplingConfig
+        self, requests: Sequence[Request], cfg: SamplingConfig
     ) -> list[GenerationResult]:
         torch.manual_seed(cfg.seed)
 
-        encoded = [self.tokenizer(p, return_tensors="pt").input_ids[0] for p in prompts]
+        budgets = [r.max_new_tokens for r in requests]
+        if any(b < 1 for b in budgets):
+            # Prefill emits a token for every row unconditionally, so a budget
+            # below one has no coherent meaning.
+            raise ValueError(f"every request needs max_new_tokens >= 1, got {budgets}")
+
+        encoded = [
+            self.tokenizer(r.prompt, return_tensors="pt").input_ids[0] for r in requests
+        ]
         # Real lengths per row. The padded width is not a prompt length and
         # must never be reported as one.
         prompt_tokens = [int(e.shape[0]) for e in encoded]
@@ -90,8 +102,10 @@ class BatchedEngine:
 
         ids, mask = self._pack(encoded)
 
-        # Everything the batch can possibly need, measured on the widest row.
-        max_len = ids.shape[1] + cfg.max_new_tokens
+        # The batch runs until its slowest member is done, so the cache is
+        # sized to the largest budget and every row pays for it.
+        steps = max(budgets)
+        max_len = ids.shape[1] + steps
 
         # Checked before allocating, so a refusal costs nothing. One slab per
         # sequence sized to the padded worst case, held for the whole batch and
@@ -109,9 +123,9 @@ class BatchedEngine:
             for _ in range(self.model.config.num_hidden_layers)
         ])
 
-        # Per row rather than per batch: a sequence that emits EOS stops
-        # collecting tokens, but its row keeps being computed. That waste is
-        # the measurement, so it must not be optimized away.
+        # Per row rather than per batch: a sequence that spends its budget
+        # stops collecting tokens, but its row keeps being computed. That waste
+        # is the measurement, so it must not be optimized away.
         #
         # A plain list, not a device tensor. `if finished[i]` on a CUDA tensor
         # forces an implicit .item(), so a tensor would cost B device syncs per
@@ -144,11 +158,13 @@ class BatchedEngine:
             logits_to_keep=1, **extra,
         )
         next_id = sample_next_token(out.logits[:, -1, :], cfg)
-        self._collect(next_id, finished, generated, stopped, cfg)
+        self._collect(next_id, finished, generated, stopped, budgets, cfg)
         trace.mark()
 
-        # DECODE. Prefill already emitted one token, so decode owes n-1.
-        for _ in range(cfg.max_new_tokens - 1):
+        # DECODE. Prefill already emitted one token, so decode owes n-1 for the
+        # longest budget in the batch. Shorter rows finish earlier and keep
+        # riding along.
+        for _ in range(steps - 1):
             if all(finished):
                 break
 
@@ -167,7 +183,7 @@ class BatchedEngine:
                 past_key_values=cache, logits_to_keep=1, **extra,
             )
             next_id = sample_next_token(out.logits[:, -1, :], cfg)
-            self._collect(next_id, finished, generated, stopped, cfg)
+            self._collect(next_id, finished, generated, stopped, budgets, cfg)
             trace.mark()
 
         peak_mem_bytes, peak_mem_source = self.memory.read()
@@ -225,12 +241,15 @@ class BatchedEngine:
         finished: list[bool],
         generated: list[list[int]],
         stopped: list[str],
+        budgets: list[int],
         cfg: SamplingConfig,
     ) -> None:
         """Append this step's token to every row that is still running.
 
         EOS is appended before the row is marked finished, matching the cached
-        engine, which concatenates then tests.
+        engine, which concatenates then tests. EOS wins over the budget when a
+        token would trigger both, since stopping early is the more specific
+        reason.
         """
         for i, token in enumerate(next_id.tolist()):
             if finished[i]:
@@ -239,3 +258,5 @@ class BatchedEngine:
             if cfg.stop_on_eos and token == self.tokenizer.eos_token_id:
                 finished[i] = True
                 stopped[i] = "eos"
+            elif len(generated[i]) >= budgets[i]:
+                finished[i] = True  # stopped_reason stays "max_new_tokens"
