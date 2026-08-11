@@ -174,8 +174,8 @@ launches per pass do not multiply with the number of sequences riding through
 it. Aggregate throughput should be roughly `B x 45.5 tok/s`, scaling close to
 linearly.
 
-**The KV pool is capped at 2 GiB from the batching engine onward**, and that cap
-is what stops the scaling. 2 GiB holds 74,898 cached token positions: 17
+**Both pool sizes are measured from the batching engine onward, unconstrained
+and capped at 2 GiB**, and at 2 GiB that cap is what stops the scaling. 2 GiB holds 74,898 cached token positions: 17
 concurrent sequences at 4352 tokens, or 146 at 512. Bandwidth does not bind
 until roughly 353,000 token positions, so capacity binds first with a 4.7x
 margin.

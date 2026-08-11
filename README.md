@@ -93,13 +93,16 @@ all, and the allocator reserves ~0.2 GiB beyond the weights themselves.
 sequences. Memory would never bind, so the memory-management work would have
 nothing to show.
 
-**The KV pool is therefore capped at 1 GiB**, which admits ~37,400 tokens:
+**Pool size is therefore an axis, swept alongside batch size from the batching
+engine onward.** Every engine is reported at two settings: unconstrained, which
+measures where bandwidth binds, and capped at 2 GiB, which admits ~74,900
+tokens and is the fixed pool every memory result is graded against.
 
-| Sequence length | Concurrent sequences at 1 GiB |
+| Sequence length | Concurrent sequences at 2 GiB |
 |---|---|
-| 512 | 73 |
-| 2048 | 18 |
-| 4352 (4096 prompt + 256 gen) | 8 |
+| 512 | 146 |
+| 2048 | 36 |
+| 4352 (4096 prompt + 256 gen) | 17 |
 
 vLLM exposes the same knob as `gpu_memory_utilization`. Sizing the pool
 deliberately and reporting behaviour at the ceiling is more informative than
@@ -115,8 +118,8 @@ by measurement rather than assumed:
   batch 1 regardless of kernel quality.
 - **Batch ~208 is where decode stops being memory-bound.** Decode arithmetic
   intensity is roughly the batch size, so it takes ~208 concurrent sequences
-  to reach the ridge. The 1 GiB pool admits far fewer than that at long
-  context, so this setup stays memory-bound by construction.
+  to reach the ridge. The 2 GiB pool admits far fewer than that at long
+  context, so the capped setup stays memory-bound by construction.
 - **KV traffic overtakes weight traffic at scale.** At batch 32 with 4K
   context, KV reads are `32 × 4096 × 28 KiB` ≈ 3.76 GB per step, exceeding
   the 3.09 GB of weights — the bottleneck shifts from weights to cache.
