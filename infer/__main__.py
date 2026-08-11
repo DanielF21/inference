@@ -20,6 +20,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--engine", default="naive", choices=ENGINE_NAMES)
     p.add_argument("--device", default="auto", help="auto | mps | cuda | cpu")
     p.add_argument("--dtype", default="float16")
+    p.add_argument("--batch-size", type=int, default=1,
+                   help="sequences per forward pass; the prompt is replicated")
+    p.add_argument("--pool-gib", type=float, default=None,
+                   help="cap KV cache at N GiB per batch (default: device limit)")
     p.add_argument("--runs", type=int, default=5, help="recorded runs per prompt")
     p.add_argument("--warmup", type=int, default=2, help="discarded-from-analysis runs")
     p.add_argument("--max-new-tokens", type=int, default=256)
@@ -63,11 +67,15 @@ def main() -> None:
     from infer.bench import run_benchmark
     from infer.engines import build_engine
 
-    engine = build_engine(args.engine, EngineConfig(device=args.device, dtype=args.dtype))
+    pool_bytes = int(args.pool_gib * 2**30) if args.pool_gib else None
+    engine = build_engine(
+        args.engine,
+        EngineConfig(device=args.device, dtype=args.dtype, pool_bytes=pool_bytes),
+    )
     run_benchmark(
         engine, prompts, sampling,
         device=args.device, dtype=args.dtype,
-        runs=args.runs, warmup=args.warmup,
+        runs=args.runs, warmup=args.warmup, batch_size=args.batch_size,
     )
 
 

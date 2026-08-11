@@ -123,6 +123,12 @@ def load() -> dict[tuple[str, int], dict]:
             for row in csv.DictReader(f):
                 if row["is_warmup"] == "True":
                     continue
+                # Every formula here is batch 1: flops_naive and flops_cached
+                # count one sequence, and decode_bytes_per_step has no batch
+                # term. Batched rows would be scored against the wrong
+                # denominator and silently understate utilization.
+                if int(row.get("batch_size") or 1) != 1:
+                    continue
                 groups[(row["engine"], int(row["prompt_tokens"]))].append(row)
 
     out = {}

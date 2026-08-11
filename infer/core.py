@@ -37,6 +37,19 @@ class EngineConfig:
 
     device: str = "auto"  # auto | mps | cuda | cpu
     dtype: str = "float16"
+    # Ceiling on KV cache bytes for one batch; None means only the device
+    # limits it. A deployment running a large model is scarce on cache memory
+    # because the weights take the card. This model is small enough that ~19
+    # GiB stays free, so scarcity has to be imposed to be studied at all.
+    pool_bytes: int | None = None
+
+
+class PoolExhausted(RuntimeError):
+    """A batch's KV cache would not fit the configured pool.
+
+    Raised before anything is allocated, so a refusal costs nothing and says
+    what it would have needed.
+    """
 
 
 @dataclass

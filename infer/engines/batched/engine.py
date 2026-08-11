@@ -16,7 +16,13 @@ from collections.abc import Sequence
 import torch
 from transformers.cache_utils import Cache
 
-from infer.core import DecodeTrace, EngineConfig, GenerationResult, SamplingConfig
+from infer.core import (
+    DecodeTrace,
+    EngineConfig,
+    GenerationResult,
+    PoolExhausted,
+    SamplingConfig,
+)
 from infer.engines.batched.cache import BatchedCacheLayer
 from infer.runtime import MemoryProbe, load_model, make_sync, resolve_device
 from infer.sampling import sample_next_token
@@ -39,7 +45,28 @@ class BatchedEngine:
             "padding_side": "left",
             "logits_to_keep": "1",
             "attn": getattr(self.model.config, "_attn_implementation", "unset"),
+            "pool_bytes": str(self.cfg.pool_bytes) if self.cfg.pool_bytes else "unbounded",
         }
+
+    @property
+    def kv_bytes_per_token(self) -> int:
+        """One cached position, K and V, across every layer.
+
+        Derived from the loaded config rather than hardcoded, so it stays
+        correct if the model changes. Qwen2.5-1.5B gives 2*2*28*2*128 = 28,672,
+        the figure the README's memory arithmetic uses.
+        """
+        config = self.model.config
+        head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        return (
+            2  # K and V
+            * self.model.dtype.itemsize
+            * config.num_hidden_layers
+            * config.num_key_value_heads
+            * head_dim
+        )
 
     def generate(
         self, prompts: Sequence[str], cfg: SamplingConfig
@@ -65,6 +92,18 @@ class BatchedEngine:
 
         # Everything the batch can possibly need, measured on the widest row.
         max_len = ids.shape[1] + cfg.max_new_tokens
+
+        # Checked before allocating, so a refusal costs nothing. One slab per
+        # sequence sized to the padded worst case, held for the whole batch and
+        # never reclaimed: that is what makes capacity bind early, and the
+        # waste is the measurement rather than a defect to fix here.
+        kv_bytes = batch_size * max_len * self.kv_bytes_per_token
+        if self.cfg.pool_bytes is not None and kv_bytes > self.cfg.pool_bytes:
+            raise PoolExhausted(
+                f"{batch_size} x {max_len} tokens needs {kv_bytes / 2**30:.3f} GiB "
+                f"of KV cache; pool is {self.cfg.pool_bytes / 2**30:.3f} GiB"
+            )
+
         cache = Cache(layers=[
             BatchedCacheLayer(max_len=max_len)
             for _ in range(self.model.config.num_hidden_layers)

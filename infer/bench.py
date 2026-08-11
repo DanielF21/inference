@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from infer.core import Engine, GenerationResult, SamplingConfig
+from infer.core import Engine, GenerationResult, PoolExhausted, SamplingConfig
 
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
 
@@ -30,6 +30,9 @@ CSV_FIELDS = [
     "engine", "engine_params", "model", "dtype", "device", "device_name", "load_s",
     # workload
     "prompt_label", "prompt_tokens", "max_new_tokens", "batch_size",
+    # Rows from one batch share a wall clock. batch_id is what lets analysis
+    # collapse them back to it; without it the seconds get counted B times.
+    "batch_id", "seq_index",
     "temperature", "top_k", "top_p", "min_p", "seed", "stop_on_eos",
     # results
     "completion_tokens", "stopped_reason", "ttft_s", "total_s", "decode_s",
@@ -83,6 +86,8 @@ def _to_row(
     is_warmup: bool,
     cfg: SamplingConfig,
     batch_size: int,
+    batch_id: str,
+    seq_index: int,
 ) -> dict[str, Any]:
     itl = result.itl_ms
     return {
@@ -93,6 +98,8 @@ def _to_row(
         "prompt_tokens": result.prompt_tokens,
         "max_new_tokens": cfg.max_new_tokens,
         "batch_size": batch_size,
+        "batch_id": batch_id,
+        "seq_index": seq_index,
         "temperature": cfg.temperature,
         "top_k": cfg.top_k,
         "top_p": cfg.top_p,
@@ -172,28 +179,47 @@ def run_benchmark(
     raw: list[dict[str, Any]] = []
 
     for label, prompt in prompts.items():
-        print(f"[bench] prompt={label!r} warmup={warmup} runs={runs}")
+        print(f"[bench] prompt={label!r} batch={batch_size} warmup={warmup} runs={runs}")
 
         for i in range(warmup + runs):
             is_warmup = i < warmup
-            result = engine.generate([prompt], cfg)[0]
+            # One batch per run. At batch_size=1 this is the single-prompt call
+            # every engine before this one made, so their rows are unchanged.
+            batch_id = uuid.uuid4().hex[:8]
+            try:
+                results = engine.generate([prompt] * batch_size, cfg)
+            except PoolExhausted as exc:
+                # A refusal is a fact about the configuration, not a
+                # measurement of one, so nothing is recorded. Every repeat
+                # would be refused identically.
+                print(f"[bench]   refused: {exc}")
+                break
 
-            row = _to_row(
-                meta, result,
-                prompt_label=label,
-                run_index=i - warmup,  # negative during warmup
-                is_warmup=is_warmup,
-                cfg=cfg,
-                batch_size=batch_size,
-            )
-            rows.append(row)
-            raw.append({**row, "token_ids": result.token_ids,
-                        "token_times_s": result.token_times_s, "text": result.text})
+            for seq_index, result in enumerate(results):
+                row = _to_row(
+                    meta, result,
+                    prompt_label=label,
+                    run_index=i - warmup,  # negative during warmup
+                    is_warmup=is_warmup,
+                    cfg=cfg,
+                    batch_size=batch_size,
+                    batch_id=batch_id,
+                    seq_index=seq_index,
+                )
+                rows.append(row)
+                raw.append({**row, "token_ids": result.token_ids,
+                            "token_times_s": result.token_times_s, "text": result.text})
+
+            # Aggregate over the batch, since every row shares one wall clock.
+            # Identical to the per-result number when batch_size is 1.
+            first = results[0]
+            decode_tokens = sum(r.completion_tokens - 1 for r in results)
+            decode_tps = decode_tokens / first.decode_s if first.decode_s > 0 else float("nan")
 
             tag = "warmup" if is_warmup else f"run {i - warmup + 1}/{runs}"
             print(
-                f"[bench]   {tag}: ttft={result.ttft_s:.3f}s "
-                f"total={result.total_s:.3f}s decode_tps={result.decode_tps:.2f}"
+                f"[bench]   {tag}: ttft={first.ttft_s:.3f}s "
+                f"total={first.total_s:.3f}s decode_tps={decode_tps:.2f}"
             )
 
     if write:
