@@ -12,7 +12,7 @@ import hashlib
 import json
 import statistics
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -88,6 +88,7 @@ def _to_row(
     batch_size: int,
     batch_id: str,
     seq_index: int,
+    max_new_tokens: int,
 ) -> dict[str, Any]:
     itl = result.itl_ms
     return {
@@ -96,7 +97,9 @@ def _to_row(
         "is_warmup": is_warmup,
         "prompt_label": prompt_label,
         "prompt_tokens": result.prompt_tokens,
-        "max_new_tokens": cfg.max_new_tokens,
+        # Per row, not from cfg: a ragged batch gives each sequence its own
+        # budget, and the batch reserves cache for the largest of them.
+        "max_new_tokens": max_new_tokens,
         "batch_size": batch_size,
         "batch_id": batch_id,
         "seq_index": seq_index,
@@ -205,6 +208,7 @@ def run_benchmark(
                     batch_size=batch_size,
                     batch_id=batch_id,
                     seq_index=seq_index,
+                    max_new_tokens=cfg.max_new_tokens,
                 )
                 rows.append(row)
                 raw.append({**row, "token_ids": result.token_ids,
@@ -221,6 +225,85 @@ def run_benchmark(
                 f"[bench]   {tag}: ttft={first.ttft_s:.3f}s "
                 f"total={first.total_s:.3f}s decode_tps={decode_tps:.2f}"
             )
+
+    if write:
+        path = write_results(rows, raw)
+        print(f"[bench] wrote {len(rows)} rows -> {path}")
+    return rows, raw
+
+
+def run_mixed_benchmark(
+    engine: Engine,
+    batch: Sequence[tuple[str, Any]],
+    cfg: SamplingConfig,
+    *,
+    device: str,
+    dtype: str,
+    runs: int = 5,
+    warmup: int = 2,
+    write: bool = True,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Benchmark one ragged batch: mixed prompt lengths and mixed budgets.
+
+    `batch` is (prompt_label, Request) pairs, normally from
+    workload.mixed_batch. The same batch runs every repeat, so spread is system
+    noise rather than a different draw.
+
+    Separate from run_benchmark because the unit differs. There the unit is a
+    prompt and the batch is one prompt replicated; here the batch is the unit
+    and every row can carry a different label, prompt length, and budget.
+
+    Requires an engine with generate_batch, which today means the batched one.
+    """
+    if not hasattr(engine, "generate_batch"):
+        raise TypeError(f"engine {engine.name!r} has no generate_batch")
+
+    meta = _session_metadata(engine, device, dtype)
+    requests = [request for _, request in batch]
+    labels = [label for label, _ in batch]
+    rows: list[dict[str, Any]] = []
+    raw: list[dict[str, Any]] = []
+
+    lengths = sorted({r.max_new_tokens for r in requests})
+    print(f"[bench] mixed batch={len(batch)} budgets={lengths} "
+          f"warmup={warmup} runs={runs}")
+
+    for i in range(warmup + runs):
+        is_warmup = i < warmup
+        batch_id = uuid.uuid4().hex[:8]
+        try:
+            results = engine.generate_batch(requests, cfg)
+        except PoolExhausted as exc:
+            print(f"[bench]   refused: {exc}")
+            break
+
+        for seq_index, (label, request, result) in enumerate(
+            zip(labels, requests, results)
+        ):
+            row = _to_row(
+                meta, result,
+                prompt_label=label,
+                run_index=i - warmup,
+                is_warmup=is_warmup,
+                cfg=cfg,
+                batch_size=len(batch),
+                batch_id=batch_id,
+                seq_index=seq_index,
+                max_new_tokens=request.max_new_tokens,
+            )
+            rows.append(row)
+            raw.append({**row, "token_ids": result.token_ids,
+                        "token_times_s": result.token_times_s, "text": result.text})
+
+        first = results[0]
+        decode_tokens = sum(r.completion_tokens - 1 for r in results)
+        decode_tps = decode_tokens / first.decode_s if first.decode_s > 0 else float("nan")
+
+        tag = "warmup" if is_warmup else f"run {i - warmup + 1}/{runs}"
+        print(
+            f"[bench]   {tag}: ttft={first.ttft_s:.3f}s "
+            f"total={first.total_s:.3f}s decode_tps={decode_tps:.2f}"
+        )
 
     if write:
         path = write_results(rows, raw)

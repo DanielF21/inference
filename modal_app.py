@@ -49,14 +49,21 @@ def bench_remote(
     sampling: dict,
     runs: int,
     warmup: int,
+    batch_size: int = 1,
+    pool_bytes: int | None = None,
+    mixed_seed: int | None = None,
 ) -> tuple[list[dict], list[dict], dict]:
     import torch
 
-    from infer.bench import run_benchmark
+    from infer.bench import run_benchmark, run_mixed_benchmark
     from infer.core import EngineConfig, SamplingConfig
     from infer.engines import build_engine
+    from infer.workload import mixed_batch
 
-    engine = build_engine(engine_name, EngineConfig(device="cuda", dtype="float16"))
+    engine = build_engine(
+        engine_name,
+        EngineConfig(device="cuda", dtype="float16", pool_bytes=pool_bytes),
+    )
 
     # Read after load, before generation: this is the weights footprint alone.
     props = torch.cuda.get_device_properties(0)
@@ -67,16 +74,17 @@ def bench_remote(
         "reserved_bytes": torch.cuda.memory_reserved(),
     }
 
-    rows, raw = run_benchmark(
-        engine,
-        prompts,
-        SamplingConfig(**sampling),
-        device="cuda",
-        dtype="float16",
-        runs=runs,
-        warmup=warmup,
-        write=False,
-    )
+    cfg = SamplingConfig(**sampling)
+    common = dict(device="cuda", dtype="float16", runs=runs, warmup=warmup, write=False)
+
+    if mixed_seed is None:
+        rows, raw = run_benchmark(engine, prompts, cfg, batch_size=batch_size, **common)
+    else:
+        # Ragged on both axes. Built here rather than shipped over the wire so
+        # only the seed crosses, and the batch stays reproducible from it.
+        rows, raw = run_mixed_benchmark(
+            engine, mixed_batch(batch_size, seed=mixed_seed), cfg, **common
+        )
     return rows, raw, device_info
 
 
@@ -88,7 +96,13 @@ def main(
     warmup: int = 2,
     max_new_tokens: int = 256,
     seed: int = 0,
+    batch_size: int = 1,
+    pool_gib: float = 0.0,
+    mixed_seed: int = -1,
 ) -> None:
+    """--mixed-seed >= 0 draws a ragged batch instead of replicating a prompt,
+    in which case --prompts is ignored. --pool-gib 0 leaves the pool unbounded.
+    """
     from infer.bench import write_results
     from infer.prompts import PROMPTS
 
@@ -103,6 +117,9 @@ def main(
         {"max_new_tokens": max_new_tokens, "seed": seed},
         runs,
         warmup,
+        batch_size,
+        int(pool_gib * 2**30) if pool_gib else None,
+        mixed_seed if mixed_seed >= 0 else None,
     )
 
     gib = 2**30

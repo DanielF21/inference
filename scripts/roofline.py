@@ -73,6 +73,16 @@ ATTN_CAUSAL = ATTN_FULL // 2            # 86,016
 KV_BYTES_PER_TOKEN = 2 * BYTES_PER_PARAM * N_LAYERS * N_KV_HEADS * HEAD_DIM
 
 
+def scale(flops: dict[str, float], batch_size: int) -> dict[str, float]:
+    """Every term is per sequence, and a batch runs B of them through one pass.
+
+    Nothing here is amortized across the batch: the weights are read once but
+    the arithmetic is not, so FLOPs scale linearly while bytes do not. That
+    asymmetry is why batching helps at all.
+    """
+    return {k: v * batch_size for k, v in flops.items()}
+
+
 def flops_naive(prompt: int, gen: int) -> dict[str, float]:
     """No cache: step i re-processes the whole sequence, n_i = prompt + i."""
     sum_n = sum(prompt + i for i in range(gen))
@@ -98,45 +108,51 @@ def flops_cached(prompt: int, gen: int) -> dict[str, float]:
     }
 
 
-def decode_bytes_per_step(prompt: int, gen: int, cached: bool) -> float:
+def decode_bytes_per_step(
+    prompt: int, gen: int, cached: bool, batch_size: int = 1
+) -> float:
     """Mean bytes crossing the bus per decode step.
 
-    Weights are read once per pass regardless of engine. A cached engine also
-    re-reads the whole cache each step; a naive engine holds no cache and
-    recomputes K and V instead, so it moves weights only.
+    Weights are read once per pass no matter how many sequences ride through
+    it, which is the whole reason batching pays. Cache traffic does scale with
+    the batch, so the weight term stops dominating once B x mean_kv is large
+    enough. A naive engine holds no cache and recomputes K and V instead, so it
+    moves weights only.
     """
     if not cached:
         return WEIGHT_BYTES
     # Step j attends over prompt + j positions, for j = 1..gen-1.
     mean_kv_tokens = prompt + gen / 2
-    return WEIGHT_BYTES + mean_kv_tokens * KV_BYTES_PER_TOKEN
+    return WEIGHT_BYTES + batch_size * mean_kv_tokens * KV_BYTES_PER_TOKEN
 
 
-def load() -> dict[tuple[str, int], dict]:
+def load() -> dict[tuple[str, int, int], dict]:
     paths = sorted(RESULTS_DIR.glob("*/runs.csv"))
     if not paths:
         raise SystemExit(f"no results under {RESULTS_DIR}/*/runs.csv")
 
-    groups: dict[tuple[str, int], list[dict]] = defaultdict(list)
+    groups: dict[tuple[str, int, int], list[dict]] = defaultdict(list)
     for path in paths:
         with path.open() as f:
             for row in csv.DictReader(f):
                 if row["is_warmup"] == "True":
                     continue
-                # Every formula here is batch 1: flops_naive and flops_cached
-                # count one sequence, and decode_bytes_per_step has no batch
-                # term. Batched rows would be scored against the wrong
-                # denominator and silently understate utilization.
-                if int(row.get("batch_size") or 1) != 1:
-                    continue
-                groups[(row["engine"], int(row["prompt_tokens"]))].append(row)
+                batch_size = int(row.get("batch_size") or 1)
+                groups[(row["engine"], int(row["prompt_tokens"]), batch_size)].append(row)
 
     out = {}
     for key, rows in groups.items():
         params = json.loads(rows[0]["engine_params"])
+        # Rows from one batch carry the same wall clock, so they are collapsed
+        # before averaging. Results recorded before batching have no batch_id
+        # and each row is its own batch, which is what it was.
+        by_batch: dict[str, tuple[float, float]] = {}
+        for index, row in enumerate(rows):
+            key_id = row.get("batch_id") or f"_row{index}"
+            by_batch[key_id] = (float(row["total_s"]), float(row["decode_s"]))
         out[key] = {
-            "total_s": statistics.mean(float(r["total_s"]) for r in rows),
-            "decode_s": statistics.mean(float(r["decode_s"]) for r in rows),
+            "total_s": statistics.mean(v[0] for v in by_batch.values()),
+            "decode_s": statistics.mean(v[1] for v in by_batch.values()),
             "gen": int(rows[0]["completion_tokens"]),
             "cached": params.get("kv_cache") == "true",
             "n": len(rows),
@@ -144,26 +160,29 @@ def load() -> dict[tuple[str, int], dict]:
     return out
 
 
-def report(data: dict[tuple[str, int], dict]) -> None:
+def report(data: dict[tuple[str, int, int], dict]) -> None:
     header = (
-        f"{'engine':<8} {'P':>5} {'body':>9} {'attn':>9} {'total':>10} "
+        f"{'engine':<8} {'P':>5} {'B':>4} {'body':>9} {'attn':>9} {'total':>10} "
         f"{'t':>8} {'TFLOPS':>8} {'MFU':>7} {'GB/step':>8} {'GB/s':>7} {'MBU':>7}"
     )
     print(header)
     print("-" * len(header))
 
-    for (engine, prompt), m in sorted(data.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+    ordered = sorted(data.items(), key=lambda kv: (kv[0][0], kv[0][1], kv[0][2]))
+    for (engine, prompt, batch_size), m in ordered:
         gen = m["gen"]
         f = (flops_cached if m["cached"] else flops_naive)(prompt, gen)
+        f = scale(f, batch_size)
         total = sum(f.values())
         achieved = total / m["total_s"]
 
-        per_step = decode_bytes_per_step(prompt, gen, m["cached"])
+        per_step = decode_bytes_per_step(prompt, gen, m["cached"], batch_size)
         step_s = m["decode_s"] / (gen - 1)
         bw = per_step / step_s
 
         print(
-            f"{engine:<8} {prompt:>5} {f['body'] / 1e12:>8.1f}T {f['attn'] / 1e12:>8.1f}T "
+            f"{engine:<8} {prompt:>5} {batch_size:>4} "
+            f"{f['body'] / 1e12:>8.1f}T {f['attn'] / 1e12:>8.1f}T "
             f"{total / 1e12:>9.1f}T {m['total_s']:>7.2f}s {achieved / 1e12:>8.2f} "
             f"{100 * achieved / PEAK_FLOPS:>6.1f}% {per_step / 1e9:>8.2f} "
             f"{bw / 1e9:>7.1f} {100 * bw / BANDWIDTH:>6.1f}%"
@@ -181,7 +200,7 @@ NAIVE_PUBLISHED = {
 }
 
 
-def check(data: dict[tuple[str, int], dict]) -> int:
+def check(data: dict[tuple[str, int, int], dict]) -> int:
     failures = 0
 
     def expect(label: str, got: float, want: float, tol: float) -> None:
@@ -210,7 +229,9 @@ def check(data: dict[tuple[str, int], dict]) -> int:
 
     print("\nnaive totals and MFU vs section VI")
     for prompt, want in NAIVE_PUBLISHED.items():
-        m = data.get(("naive", prompt))
+        # Batch 1: the published figures predate batching, and the batch term
+        # must leave them exactly where they were.
+        m = data.get(("naive", prompt, 1))
         if m is None:
             print(f"  [SKIP] P={prompt}: no recorded naive runs")
             continue
