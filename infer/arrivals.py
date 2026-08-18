@@ -35,7 +35,7 @@ RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
 
 ARRIVAL_FIELDS = [
     "sweep_id", "ts_utc", "engine", "engine_params", "device_name",
-    "rate_per_s", "max_batch", "seed", "n_requests",
+    "rate_per_s", "max_batch", "seed", "n_requests", "n_unserved",
     "batch_index", "prompt_label", "prompt_tokens", "max_new_tokens",
     "completion_tokens", "arrival_s", "start_s", "queue_s", "ttft_s", "latency_s",
 ]
@@ -56,8 +56,8 @@ class ArrivalRecord:
     completion_tokens: int
     arrival_s: float
     start_s: float
-    queue_s: float   # start - arrival: how long it sat waiting
-    ttft_s: float    # first token, from arrival
+    queue_s: float    # start - arrival: how long it sat waiting
+    ttft_s: float     # first token, from arrival
     latency_s: float  # completion, from arrival
 
 
@@ -68,13 +68,17 @@ def replay(
     cfg: SamplingConfig,
     *,
     max_batch: int,
-) -> list[ArrivalRecord]:
+) -> tuple[list[ArrivalRecord], int]:
     """Serve `batch` against `arrivals` under a strictly static policy.
 
     Form a batch from whatever has arrived, run it to completion, and only then
     look at the queue again. No mid-batch admission, no eviction. The dumbness
     is the measurement: adding admission control here would quietly be
     continuous batching and would delete the number this exists to produce.
+
+    Returns (records, unserved). A pool refusal stops admission rather than
+    discarding the run: everything already served is real and worth keeping,
+    and how far it got before refusing is itself the finding.
     """
     if len(batch) != len(arrivals):
         raise ValueError(f"{len(batch)} requests against {len(arrivals)} arrivals")
@@ -99,7 +103,13 @@ def replay(
 
         requests = [batch[i][1] for i in window]
         start = clock
-        results = engine.generate_batch(requests, cfg)
+        try:
+            results = engine.generate_batch(requests, cfg)
+        except PoolExhausted as exc:
+            # Every later batch would be refused the same way, so stop here and
+            # report what was served rather than losing it.
+            print(f"[arrivals]   refused after {len(records)} served: {exc}")
+            return records, len(batch) - len(records)
 
         # Every row in a batch shares its prefill and its step boundaries.
         duration = results[0].total_s
@@ -123,7 +133,7 @@ def replay(
         clock = start + duration
         batch_index += 1
 
-    return records
+    return records, 0
 
 
 def percentile(values: list[float], q: float) -> float:
@@ -136,12 +146,23 @@ def percentile(values: list[float], q: float) -> float:
 
 
 def summarize(records: list[ArrivalRecord], rate: float) -> dict[str, float]:
+    """Queueing and latency percentiles for one arrival rate.
+
+    Throughput is served requests over the span from the first arrival to the
+    last completion, so idle time waiting for arrivals counts against it. That
+    is what an open system's throughput means.
+    """
+    if not records:
+        return {"rate": rate, "served": 0}
+
     queue = [r.queue_s for r in records]
     ttft = [r.ttft_s for r in records]
     latency = [r.latency_s for r in records]
-    span = max(r.start_s + (r.latency_s - r.queue_s) for r in records)
+    span = max(r.arrival_s + r.latency_s for r in records)
+
     return {
         "rate": rate,
+        "served": len(records),
         "served_per_s": len(records) / span if span else float("nan"),
         "tokens_per_s": sum(r.completion_tokens for r in records) / span if span else float("nan"),
         "queue_p50": statistics.median(queue),
@@ -157,53 +178,43 @@ def summarize(records: list[ArrivalRecord], rate: float) -> dict[str, float]:
 
 def print_summary(rows: list[dict[str, float]]) -> None:
     header = (
-        f"{'rate/s':>7} {'served/s':>9} {'tok/s':>8} "
+        f"{'rate/s':>7} {'served':>7} {'served/s':>9} {'tok/s':>8} "
         f"{'queue_p50':>10} {'queue_p95':>10} {'queue_p99':>10} "
         f"{'ttft_p95':>9} {'lat_p95':>9}"
     )
     print(f"\n{header}\n{'-' * len(header)}")
     for r in rows:
+        if not r.get("served"):
+            print(f"{r['rate']:>7.1f} {'0':>7}   (nothing served)")
+            continue
         print(
-            f"{r['rate']:>7.1f} {r['served_per_s']:>9.2f} {r['tokens_per_s']:>8.1f} "
+            f"{r['rate']:>7.1f} {r['served']:>7} {r['served_per_s']:>9.2f} "
+            f"{r['tokens_per_s']:>8.1f} "
             f"{r['queue_p50']:>9.2f}s {r['queue_p95']:>9.2f}s {r['queue_p99']:>9.2f}s "
             f"{r['ttft_p95']:>8.2f}s {r['latency_p95']:>8.2f}s"
         )
 
 
-def write_arrivals(
-    engine: Any,
-    records_by_rate: list[tuple[float, int, int, int, list[ArrivalRecord]]],
-    device_name: str,
-) -> Path:
+def write_arrivals(engine_name: str, rows: list[dict[str, Any]]) -> Path:
     """Append to results/<engine>/arrivals.csv.
 
     A separate file from runs.csv: the unit there is a run of one engine
     configuration, here it is one request's journey through a queue. Forcing
     them into one schema would leave most columns empty in both directions.
+
+    Takes rows rather than an engine, so a remote worker can hand records back
+    for the local side to write, the way bench.write_results already does.
     """
-    out_dir = RESULTS_DIR / engine.name
+    out_dir = RESULTS_DIR / engine_name
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "arrivals.csv"
-
-    sweep_id = uuid.uuid4().hex[:8]
-    stamp = datetime.now(UTC).isoformat(timespec="seconds")
-    params = json.dumps(engine.describe(), sort_keys=True)
 
     write_header = not path.exists()
     with path.open("a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=ARRIVAL_FIELDS, extrasaction="ignore")
         if write_header:
             writer.writeheader()
-        for rate, max_batch, seed, n_requests, records in records_by_rate:
-            for record in records:
-                writer.writerow({
-                    "sweep_id": sweep_id, "ts_utc": stamp,
-                    "engine": engine.name, "engine_params": params,
-                    "device_name": device_name,
-                    "rate_per_s": rate, "max_batch": max_batch,
-                    "seed": seed, "n_requests": n_requests,
-                    **asdict(record),
-                })
+        writer.writerows(rows)
     return path
 
 
@@ -217,36 +228,49 @@ def run_sweep(
     seed: int,
     device_name: str = "",
     write: bool = True,
-) -> list[dict[str, float]]:
-    """One arrival trace per rate, same seed, so engines can be diffed later.
+) -> tuple[list[dict[str, float]], list[dict[str, Any]]]:
+    """One arrival trace per rate. Returns (summaries, csv-ready rows).
 
-    The trace is drawn once per rate and reused across engines: comparing
-    scheduling policies needs the same requests arriving at the same moments,
-    not two independent samples of the same distribution.
+    The trace is drawn from the same seed at every rate and for every engine,
+    so comparing scheduling policies later means the same requests arriving at
+    the same moments rather than two samples of one distribution.
     """
     from infer.workload import mixed_batch, poisson_arrivals
 
-    collected: list[tuple[float, int, int, int, list[ArrivalRecord]]] = []
+    sweep_id = uuid.uuid4().hex[:8]
+    stamp = datetime.now(UTC).isoformat(timespec="seconds")
+    params = json.dumps(engine.describe(), sort_keys=True)
+
+    rows: list[dict[str, Any]] = []
     summaries: list[dict[str, float]] = []
 
     for rate in rates:
-        batch = mixed_batch(n_requests, seed=seed)
+        batch = mixed_batch(n_requests, seed=seed,
+                            max_new_tokens=cfg.max_new_tokens)
         arrivals = poisson_arrivals(n_requests, rate=rate, seed=seed)
         print(f"[arrivals] rate={rate}/s n={n_requests} max_batch={max_batch}")
-        try:
-            records = replay(engine, batch, arrivals, cfg, max_batch=max_batch)
-        except PoolExhausted as exc:
-            print(f"[arrivals]   refused: {exc}")
-            continue
 
-        collected.append((rate, max_batch, seed, n_requests, records))
+        records, unserved = replay(engine, batch, arrivals, cfg, max_batch=max_batch)
+
+        for record in records:
+            rows.append({
+                "sweep_id": sweep_id, "ts_utc": stamp,
+                "engine": engine.name, "engine_params": params,
+                "device_name": device_name,
+                "rate_per_s": rate, "max_batch": max_batch,
+                "seed": seed, "n_requests": n_requests, "n_unserved": unserved,
+                **asdict(record),
+            })
+
         summary = summarize(records, rate)
         summaries.append(summary)
-        print(f"[arrivals]   {len(records)} served, "
-              f"queue p95 {summary['queue_p95']:.2f}s, "
-              f"ttft p95 {summary['ttft_p95']:.2f}s")
+        if records:
+            print(f"[arrivals]   {len(records)} served"
+                  f"{f', {unserved} unserved' if unserved else ''}, "
+                  f"queue p95 {summary['queue_p95']:.2f}s, "
+                  f"ttft p95 {summary['ttft_p95']:.2f}s")
 
-    if write and collected:
-        path = write_arrivals(engine, collected, device_name)
-        print(f"[arrivals] wrote {sum(len(c[4]) for c in collected)} records -> {path}")
-    return summaries
+    if write and rows:
+        path = write_arrivals(engine.name, rows)
+        print(f"[arrivals] wrote {len(rows)} records -> {path}")
+    return summaries, rows

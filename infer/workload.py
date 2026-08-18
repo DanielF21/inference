@@ -17,16 +17,25 @@ from collections.abc import Sequence
 from infer.core import Request
 from infer.prompts import PROMPTS
 
-# Mixed output lengths, per the load-testing methodology. Mean 160 against a
-# max of 256, so a static batch discards 37.5% of its decode row steps.
-BUDGETS = (64, 128, 192, 256)
+# Mixed output lengths, per the load-testing methodology. Held as fractions of
+# the run's max_new_tokens rather than fixed counts, so --max-new-tokens is not
+# silently ignored and a short smoke run costs seconds instead of minutes.
+#
+# The mean is 0.625 of the max at any budget, so a static batch discards 37.5%
+# of its decode row steps whatever the scale. At 256 this is (64, 128, 192, 256).
+BUDGET_FRACTIONS = (0.25, 0.5, 0.75, 1.0)
+
+
+def budgets_for(max_new_tokens: int) -> tuple[int, ...]:
+    return tuple(max(1, round(f * max_new_tokens)) for f in BUDGET_FRACTIONS)
 
 
 def mixed_batch(
     batch_size: int,
     seed: int,
+    max_new_tokens: int,
     labels: Sequence[str] | None = None,
-    budgets: Sequence[int] = BUDGETS,
+    budgets: Sequence[int] | None = None,
 ) -> list[tuple[str, Request]]:
     """Draw (prompt_label, Request) pairs, ragged on both axes.
 
@@ -39,11 +48,12 @@ def mixed_batch(
     """
     rng = random.Random(seed)
     pool = list(labels if labels is not None else PROMPTS)
+    choices = list(budgets if budgets is not None else budgets_for(max_new_tokens))
 
     batch = []
     for _ in range(batch_size):
         label = rng.choice(pool)
-        batch.append((label, Request(PROMPTS[label], rng.choice(list(budgets)))))
+        batch.append((label, Request(PROMPTS[label], rng.choice(choices))))
     return batch
 
 

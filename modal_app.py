@@ -83,9 +83,72 @@ def bench_remote(
         # Ragged on both axes. Built here rather than shipped over the wire so
         # only the seed crosses, and the batch stays reproducible from it.
         rows, raw = run_mixed_benchmark(
-            engine, mixed_batch(batch_size, seed=mixed_seed), cfg, **common
+            engine, mixed_batch(batch_size, seed=mixed_seed,
+                         max_new_tokens=cfg.max_new_tokens), cfg, **common
         )
     return rows, raw, device_info
+
+
+@app.function(gpu=GPU, timeout=3600)
+def arrivals_remote(
+    engine_name: str,
+    sampling: dict,
+    rates: list[float],
+    n_requests: int,
+    max_batch: int,
+    seed: int,
+    pool_bytes: int | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Open-arrival sweep on the A10. Returns (summaries, csv rows).
+
+    Records come back rather than being written here, matching bench_remote,
+    so remote and local sweeps land in the same results/<engine>/arrivals.csv.
+    """
+    from infer.arrivals import run_sweep
+    from infer.core import EngineConfig, SamplingConfig
+    from infer.engines import build_engine
+    from infer.runtime import device_name, resolve_device
+
+    engine = build_engine(
+        engine_name,
+        EngineConfig(device="cuda", dtype="float16", pool_bytes=pool_bytes),
+    )
+    return run_sweep(
+        engine, rates,
+        cfg=SamplingConfig(**sampling),
+        n_requests=n_requests,
+        max_batch=max_batch,
+        seed=seed,
+        device_name=device_name(resolve_device("cuda")),
+        write=False,
+    )
+
+
+@app.local_entrypoint()
+def arrivals(
+    engine: str = "batched",
+    rates: str = "1,3,5,7",
+    n_requests: int = 400,
+    max_batch: int = 32,
+    max_new_tokens: int = 256,
+    seed: int = 0,
+    pool_gib: float = 0.0,
+) -> None:
+    """uv run modal run modal_app.py::arrivals --rates 1,3,5,7"""
+    from infer.arrivals import print_summary, write_arrivals
+
+    summaries, rows = arrivals_remote.remote(
+        engine,
+        {"max_new_tokens": max_new_tokens, "seed": seed},
+        [float(r) for r in rates.split(",") if r.strip()],
+        n_requests,
+        max_batch,
+        seed,
+        int(pool_gib * 2**30) if pool_gib else None,
+    )
+    print_summary(summaries)
+    if rows:
+        print(f"[modal] wrote {len(rows)} records -> {write_arrivals(engine, rows)}")
 
 
 @app.local_entrypoint()

@@ -43,6 +43,15 @@ def load_rows(include_warmup: bool = False) -> list[dict]:
     return rows
 
 
+def percentile(values: list[float], q: float) -> float:
+    """Nearest-rank, matching infer/bench.py and infer/arrivals.py."""
+    if not values:
+        return float("nan")
+    ordered = sorted(values)
+    idx = max(0, min(len(ordered) - 1, round(q / 100 * len(ordered) + 0.5) - 1))
+    return ordered[idx]
+
+
 def batch_seconds(group: list[dict], field: str) -> float:
     """Sum `field` counting each batch once.
 
@@ -198,6 +207,62 @@ def padding(rows: list[dict]) -> None:
         )
 
 
+def arrivals() -> None:
+    """Queueing under open arrivals, per (engine, rate).
+
+    Reads results/<engine>/arrivals.csv, which runs.csv cannot hold: the unit
+    there is a run of one configuration, here it is one request's journey
+    through a queue.
+
+    Percentiles are computed on times measured from arrival, not from batch
+    start. That distinction is the entire point of the measurement: a request
+    that misses a batch by a millisecond waits for the whole batch, and only
+    the arrival-relative number shows it.
+    """
+    paths = sorted(RESULTS_DIR.glob("*/arrivals.csv"))
+    if not paths:
+        return
+
+    records: list[dict] = []
+    for path in paths:
+        with path.open() as f:
+            records.extend(csv.DictReader(f))
+    if not records:
+        return
+
+    groups: dict[tuple[str, float, int], list[dict]] = defaultdict(list)
+    for r in records:
+        groups[(r["engine"], float(r["rate_per_s"]), int(r["max_batch"]))].append(r)
+
+    header = (
+        f"{'engine':<10} {'rate/s':>7} {'maxB':>5} {'served':>7} {'tok/s':>8} "
+        f"{'queue_p50':>10} {'queue_p95':>10} {'queue_p99':>10} {'ttft_p95':>9}"
+    )
+    print(f"\nopen arrivals, timed from arrival\n{header}")
+    print("-" * len(header))
+
+    for (engine, rate, max_batch), group in sorted(groups.items()):
+        queue = [float(r["queue_s"]) for r in group]
+        ttft = [float(r["ttft_s"]) for r in group]
+        # Span from the first arrival to the last completion, so time spent
+        # waiting for arrivals counts against throughput. That is what an open
+        # system's throughput means.
+        span = max(float(r["arrival_s"]) + float(r["latency_s"]) for r in group)
+        tokens = sum(int(r["completion_tokens"]) for r in group)
+
+        print(
+            f"{engine:<10} {rate:>7.1f} {max_batch:>5} {len(group):>7} "
+            f"{tokens / span if span else float('nan'):>8.1f} "
+            f"{statistics.median(queue):>9.2f}s {percentile(queue, 95):>9.2f}s "
+            f"{percentile(queue, 99):>9.2f}s {percentile(ttft, 95):>8.2f}s"
+        )
+
+    unserved = {int(r["n_unserved"]) for r in records if r.get("n_unserved")}
+    if unserved - {0}:
+        print(f"  note: some rates left requests unserved {sorted(unserved - {0})}, "
+              f"the pool refused mid sweep")
+
+
 def parity(engine_a: str, engine_b: str) -> None:
     """Report the first index where two engines' greedy token ids diverge.
 
@@ -256,6 +321,7 @@ def main() -> None:
     summarize(rows)
     speedup(rows, args.baseline)
     padding(rows)
+    arrivals()
 
 
 if __name__ == "__main__":

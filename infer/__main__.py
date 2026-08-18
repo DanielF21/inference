@@ -24,6 +24,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help="sequences per forward pass; the prompt is replicated")
     p.add_argument("--pool-gib", type=float, default=None,
                    help="cap KV cache at N GiB per batch (default: device limit)")
+    p.add_argument("--mixed-seed", type=int, default=None,
+                   help="draw a ragged batch from this seed instead of "
+                        "replicating one prompt; ignores --prompts")
+    # Open-arrival mode: requests show up over time and queue, which is where
+    # static batching's defect lives. See infer/arrivals.py.
+    p.add_argument("--arrivals", action="store_true",
+                   help="run an arrival-rate sweep instead of a benchmark")
+    p.add_argument("--rates", default="1,3,5,7",
+                   help="--arrivals: comma-separated arrivals per second")
+    p.add_argument("--n-requests", type=int, default=400,
+                   help="--arrivals: requests per rate")
+    p.add_argument("--max-batch", type=int, default=32,
+                   help="--arrivals: most sequences one batch may hold")
     p.add_argument("--runs", type=int, default=5, help="recorded runs per prompt")
     p.add_argument("--warmup", type=int, default=2, help="discarded-from-analysis runs")
     p.add_argument("--max-new-tokens", type=int, default=256)
@@ -38,6 +51,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--top-p", type=float, default=None)
     p.add_argument("--min-p", type=float, default=None)
     p.add_argument("--stop-on-eos", action="store_true")
+    # results/ holds A10 runs only, so local dev-loop output must be able to
+    # stay out of it. Without this the only way to smoke test is to record and
+    # then delete, which is one forgotten step away from a contaminated file.
+    p.add_argument("--no-write", action="store_true",
+                   help="print results without touching results/")
     return p
 
 
@@ -64,19 +82,46 @@ def main() -> None:
     )
 
     # Imported here, not at module scope, so --help never loads a model.
-    from infer.bench import run_benchmark
+    from infer.bench import run_benchmark, run_mixed_benchmark
     from infer.engines import build_engine
+    from infer.runtime import device_name, resolve_device
 
     pool_bytes = int(args.pool_gib * 2**30) if args.pool_gib else None
     engine = build_engine(
         args.engine,
         EngineConfig(device=args.device, dtype=args.dtype, pool_bytes=pool_bytes),
     )
-    run_benchmark(
-        engine, prompts, sampling,
-        device=args.device, dtype=args.dtype,
-        runs=args.runs, warmup=args.warmup, batch_size=args.batch_size,
+
+    if args.arrivals:
+        from infer.arrivals import print_summary, run_sweep
+
+        summaries, _ = run_sweep(
+            engine,
+            [float(r) for r in args.rates.split(",") if r.strip()],
+            cfg=sampling,
+            n_requests=args.n_requests,
+            max_batch=args.max_batch,
+            seed=args.seed,
+            device_name=device_name(resolve_device(args.device)),
+            write=not args.no_write,
+        )
+        print_summary(summaries)
+        return
+
+    common = dict(
+        device=args.device, dtype=args.dtype, runs=args.runs, warmup=args.warmup,
+        write=not args.no_write,
     )
+    if args.mixed_seed is not None:
+        from infer.workload import mixed_batch
+
+        run_mixed_benchmark(
+            engine, mixed_batch(args.batch_size, seed=args.mixed_seed,
+                        max_new_tokens=args.max_new_tokens),
+            sampling, **common,
+        )
+    else:
+        run_benchmark(engine, prompts, sampling, batch_size=args.batch_size, **common)
 
 
 if __name__ == "__main__":

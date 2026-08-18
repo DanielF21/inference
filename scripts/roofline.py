@@ -73,14 +73,20 @@ ATTN_CAUSAL = ATTN_FULL // 2            # 86,016
 KV_BYTES_PER_TOKEN = 2 * BYTES_PER_PARAM * N_LAYERS * N_KV_HEADS * HEAD_DIM
 
 
-def scale(flops: dict[str, float], batch_size: int) -> dict[str, float]:
-    """Every term is per sequence, and a batch runs B of them through one pass.
+def flops_batch(seqs: list[tuple[int, int]], cached: bool) -> dict[str, float]:
+    """Sum per sequence, because a ragged batch has no single prompt length.
 
-    Nothing here is amortized across the batch: the weights are read once but
-    the arithmetic is not, so FLOPs scale linearly while bytes do not. That
-    asymmetry is why batching helps at all.
+    Summing rather than multiplying by B is what makes this correct for a mixed
+    batch and identical to `B x per-sequence` for a uniform one. Nothing is
+    amortized: the weights are read once per pass but the arithmetic is not,
+    which is the asymmetry that makes batching pay.
     """
-    return {k: v * batch_size for k, v in flops.items()}
+    fn = flops_cached if cached else flops_naive
+    total = {"body": 0.0, "head": 0.0, "attn": 0.0}
+    for prompt, gen in seqs:
+        for key, value in fn(prompt, gen).items():
+            total[key] += value
+    return total
 
 
 def flops_naive(prompt: int, gen: int) -> dict[str, float]:
@@ -108,54 +114,68 @@ def flops_cached(prompt: int, gen: int) -> dict[str, float]:
     }
 
 
-def decode_bytes_per_step(
-    prompt: int, gen: int, cached: bool, batch_size: int = 1
-) -> float:
-    """Mean bytes crossing the bus per decode step.
+def decode_bytes_per_step(seqs: list[tuple[int, int]], cached: bool) -> float:
+    """Mean bytes crossing the bus per decode step, for a whole batch.
 
     Weights are read once per pass no matter how many sequences ride through
     it, which is the whole reason batching pays. Cache traffic does scale with
-    the batch, so the weight term stops dominating once B x mean_kv is large
-    enough. A naive engine holds no cache and recomputes K and V instead, so it
-    moves weights only.
+    the batch, so the weight term stops dominating once total cached positions
+    are large enough. A naive engine holds no cache and recomputes K and V
+    instead, so it moves weights only.
     """
     if not cached:
         return WEIGHT_BYTES
-    # Step j attends over prompt + j positions, for j = 1..gen-1.
-    mean_kv_tokens = prompt + gen / 2
-    return WEIGHT_BYTES + batch_size * mean_kv_tokens * KV_BYTES_PER_TOKEN
+    # Sequence i attends over prompt_i + j positions, for j = 1..gen_i-1.
+    mean_kv_tokens = sum(prompt + gen / 2 for prompt, gen in seqs)
+    return WEIGHT_BYTES + mean_kv_tokens * KV_BYTES_PER_TOKEN
 
 
-def load() -> dict[tuple[str, int, int], dict]:
+def load() -> dict[tuple[str, object, int], dict]:
+    """Group by batch, then by configuration.
+
+    The batch is the unit, not the row: a ragged batch holds several prompt
+    lengths and several budgets, so keying on prompt_tokens would split one
+    batch across groups and then charge each fragment the full batch size.
+    A batch whose rows share a length keys on it; anything else keys on
+    "mixed".
+    """
     paths = sorted(RESULTS_DIR.glob("*/runs.csv"))
     if not paths:
         raise SystemExit(f"no results under {RESULTS_DIR}/*/runs.csv")
 
-    groups: dict[tuple[str, int, int], list[dict]] = defaultdict(list)
+    batches: dict[str, list[dict]] = defaultdict(list)
+    order = 0
     for path in paths:
         with path.open() as f:
             for row in csv.DictReader(f):
                 if row["is_warmup"] == "True":
                     continue
-                batch_size = int(row.get("batch_size") or 1)
-                groups[(row["engine"], int(row["prompt_tokens"]), batch_size)].append(row)
+                # Results recorded before batching predate the column; each
+                # such row is its own batch, which is what it was.
+                order += 1
+                batches[row.get("batch_id") or f"_row{order}"].append(row)
+
+    groups: dict[tuple[str, object, int], list[list[dict]]] = defaultdict(list)
+    for rows in batches.values():
+        lengths = {int(r["prompt_tokens"]) for r in rows}
+        label = next(iter(lengths)) if len(lengths) == 1 else "mixed"
+        groups[(rows[0]["engine"], label, len(rows))].append(rows)
 
     out = {}
-    for key, rows in groups.items():
-        params = json.loads(rows[0]["engine_params"])
-        # Rows from one batch carry the same wall clock, so they are collapsed
-        # before averaging. Results recorded before batching have no batch_id
-        # and each row is its own batch, which is what it was.
-        by_batch: dict[str, tuple[float, float]] = {}
-        for index, row in enumerate(rows):
-            key_id = row.get("batch_id") or f"_row{index}"
-            by_batch[key_id] = (float(row["total_s"]), float(row["decode_s"]))
+    for key, repeats in groups.items():
+        first = repeats[0]
+        params = json.loads(first[0]["engine_params"])
         out[key] = {
-            "total_s": statistics.mean(v[0] for v in by_batch.values()),
-            "decode_s": statistics.mean(v[1] for v in by_batch.values()),
-            "gen": int(rows[0]["completion_tokens"]),
+            # Composition of one batch: every repeat runs the same one.
+            "seqs": [
+                (int(r["prompt_tokens"]), int(r["completion_tokens"])) for r in first
+            ],
+            # Rows in a batch carry the same wall clock, so read it once.
+            "total_s": statistics.mean(float(rows[0]["total_s"]) for rows in repeats),
+            "decode_s": statistics.mean(float(rows[0]["decode_s"]) for rows in repeats),
+            "gen": max(int(r["completion_tokens"]) for r in first),
             "cached": params.get("kv_cache") == "true",
-            "n": len(rows),
+            "n": len(repeats),
         }
     return out
 
@@ -168,20 +188,23 @@ def report(data: dict[tuple[str, int, int], dict]) -> None:
     print(header)
     print("-" * len(header))
 
-    ordered = sorted(data.items(), key=lambda kv: (kv[0][0], kv[0][1], kv[0][2]))
+    ordered = sorted(
+        data.items(),
+        key=lambda kv: (kv[0][0], isinstance(kv[0][1], str), kv[0][1], kv[0][2]),
+    )
     for (engine, prompt, batch_size), m in ordered:
-        gen = m["gen"]
-        f = (flops_cached if m["cached"] else flops_naive)(prompt, gen)
-        f = scale(f, batch_size)
+        f = flops_batch(m["seqs"], m["cached"])
         total = sum(f.values())
         achieved = total / m["total_s"]
 
-        per_step = decode_bytes_per_step(prompt, gen, m["cached"], batch_size)
-        step_s = m["decode_s"] / (gen - 1)
+        per_step = decode_bytes_per_step(m["seqs"], m["cached"])
+        # The batch runs until its slowest member is done, so step count comes
+        # from the largest budget in it.
+        step_s = m["decode_s"] / (m["gen"] - 1)
         bw = per_step / step_s
 
         print(
-            f"{engine:<8} {prompt:>5} {batch_size:>4} "
+            f"{engine:<8} {str(prompt):>5} {batch_size:>4} "
             f"{f['body'] / 1e12:>8.1f}T {f['attn'] / 1e12:>8.1f}T "
             f"{total / 1e12:>9.1f}T {m['total_s']:>7.2f}s {achieved / 1e12:>8.2f} "
             f"{100 * achieved / PEAK_FLOPS:>6.1f}% {per_step / 1e9:>8.2f} "
