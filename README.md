@@ -2,47 +2,57 @@
 
 **Part 0: what this is**
 
-I am building an LLM inference engine from scratch to find out where the time
-actually goes. Each engine in the series adds one idea to the one before it,
-runs on the same GPU against the same model, and gets a writeup with its
-numbers in it. The first engine, which caches nothing, generates **3.60 tokens
-per second** on a 4096 token prompt. The second one changes exactly one thing
-and generates **45.80**.
+A language model that has finished training is not yet a service. Something
+has to hold it in memory, take a prompt, run the model once for every token it
+produces, and hand the tokens back. That something is an inference engine, and
+it decides how fast the first word appears, how fast the rest follow, and how
+many people can be served at once on one card.
 
-There is no planned end. The next engine is whatever the last one's bottleneck
-says it should be, so I do not know yet what the final part is.
+This is a series about building one from scratch and measuring it at every
+step. Each part adds one idea to the engine before it, runs on the same GPU
+against the same model and the same prompts, and reports what improved and
+what became the next constraint. The next engine is chosen by the last one's
+numbers, so the series has no planned end.
 
-## The parts
+## How text gets generated
 
-| | engine | the question | at a 16 token prompt | at a 4096 token prompt |
-|---|---|---|---|---|
-| [Part 1](results/naive/analysis.md) | no cache | what does recomputing everything cost? | 45.66 tok/s | 3.60 tok/s |
-| [Part 2](results/cached/analysis.md) | KV cache | what does a cache actually buy? | 44.05 tok/s | 45.80 tok/s |
+A model does not produce an answer. It produces one token, which is a word or
+a fragment of one, and then it is done. To get a sentence out you feed it the
+prompt, take the token it returns, append that token to the prompt, and feed
+the whole thing back. Generating 256 tokens means running the model 256 times.
 
-**Part 1** pays for every token it has already produced, over and over, and by
-the longest prompt 99.6% of its arithmetic is recomputing values that cannot
-change. The odd part is that it gets *more* efficient in hardware terms as it
-gets slower, reaching 36.3% of the A10's peak fp16 throughput while running 12.7x
-slower than it started.
+That loop has two halves, and they cost completely different things.
 
-**Part 2** deletes that redundancy and goes flat: 44 to 46 tok/s at every prompt
-length from 16 tokens to 4096. It is a 12.73x speedup at 4096 tokens and a 0.96x
-regression at 16. The bottleneck stops being arithmetic and becomes the CPU,
-which cannot feed the GPU fast enough to keep it busy for more than about a
-quarter of each step.
+**Prefill** is the first pass, the one over the prompt. Every token of the
+prompt goes through the model at once, which is a large amount of arithmetic
+performed in one go. Its cost grows with the length of the prompt.
 
-![Inter token latency against prompt length, both engines](results/cached/itl.png)
+**Decode** is every pass after that. Each one handles a single new token.
+There is very little arithmetic in a decode step, but the model's entire set
+of weights still has to be read out of memory to perform it, and on the 1.5
+billion parameter model used here that is 3.09 GB. Reading 3.09 GB at the
+A10's 600 GB/s takes 5.15 ms. That is the fastest a single token can possibly
+appear on this card: **194 tokens per second**.
 
-Every point above is the median of five recorded runs. The engine with no cache
-gets more expensive per token as the prompt grows, because each step
-reprocesses the whole sequence. The cached one is flat at about 22 ms per
-token. The two dashed lines are what those 22 ms are up against: the upper one
-is the measured cost of a forward pass that does almost no GPU work at all, and
-the lower one is the 5.1 ms of memory traffic a step actually needs. Almost the
-entire gap between them is the CPU.
+The two are reported separately in every part. **Time to first token** is the
+cost of prefill, the wait before anything appears on screen. **Inter token
+latency** is the cost of one decode step, the gap between words once they
+start. Tokens per second is that gap inverted. Averaging the two together
+hides both.
 
-A third engine, batched, exists in the tree and has no recorded runs yet, so it
-has no part.
+One more property of the loop. Attention works by having each token compare
+itself against every earlier token and take a weighted sum of what it finds.
+Each token contributes two vectors to that: a key, which later tokens match
+against, and a value, which they sum. Attention is causal, so a token may look
+backwards and never forwards, which means a token's key and value are fixed
+the moment they are computed. Whatever the model works out about token 5 is
+the same on step 6 as it is on step 200.
+
+An engine can therefore hold those keys and values between steps, or throw
+them away and derive them again. Holding them is what a **KV cache** is.
+
+So an engine is three things: the loop that runs the model, the memory it
+holds between steps, and the decision of which requests run together.
 
 ## The model and the machine
 
@@ -55,6 +65,13 @@ independent variable.
 | Layers | 28 | Key value heads | 2 |
 | Hidden size | 1536 | Head dim | 128 |
 | Vocab | 151,936 | | |
+
+There are 12 attention heads but only 2 key value heads, an arrangement called
+grouped query attention. Under it, several attention heads share one set of
+keys and values instead of each keeping its own, which makes the memory a
+cache holds 6x smaller. The 28
+layers are the multiplier on nearly everything else: each one holds its own
+slice of that memory, and each one issues its own instructions to the GPU.
 
 **NVIDIA A10, rented from Modal.** Local machines are for the dev loop only.
 Every recorded number in every part comes from the A10, so the parts are
@@ -72,48 +89,64 @@ model for every token it produces, so bandwidth is the thing being optimized,
 and the A10 is roughly 2x faster at it. [Every option I
 considered](docs/hardware.md).
 
-## The four numbers this series runs on
+## What the hardware sets
 
-| | | why it matters |
+Four numbers follow from the model and the card alone. They say what any
+engine here can and cannot do before a line of it is written.
+
+| | | |
 |---|---|---|
-| KV cache | 28 KiB per token | grouped query attention makes it 6x cheaper than plain multi head attention would be |
-| Ridge point | 208 FLOP per byte | below this the A10 is starved of data, not of compute |
-| Batch 1 ceiling | 194 tok/s | reading 3.09 GB of weights at 600 GB/s takes 5.1 ms, and one token needs all of them |
-| Free for the cache | ~19 GiB | measured on the card after loading the model, not read off a spec sheet |
+| KV cache | 28 KiB per token | grouped query attention makes it 6x smaller than plain multi head attention would be |
+| Ridge point | 208 FLOP per byte | below this the A10 runs out of data before it runs out of compute |
+| Batch 1 ceiling | 194 tok/s | reading 3.09 GB of weights at 600 GB/s takes 5.15 ms, and one token needs all of them |
+| Free for the cache | ~19 GiB | measured on the card after the model is loaded, not read off a spec sheet |
 
-[Where each of these comes from](docs/arithmetic.md). They are worth carrying
-into the parts, because between them they say what any engine here can and
-cannot do before a line of it is written.
+Two of those need a definition. **Arithmetic intensity** is how many arithmetic
+operations a piece of work performs for each byte it moves. Every chip has a
+**ridge point**, the intensity at which its arithmetic units and its memory
+system would finish at the same moment. Work below the ridge point leaves the
+arithmetic units idle waiting on data. Work above it leaves the memory system
+idle instead. Prefill sits well above the A10's ridge point and decode sits
+far below it, which is why they are measured separately and why they respond
+to different fixes.
 
-## What I predicted, and how it is going
-
-Each part ends with a numbered prediction about the next one, written before
-the next one exists. Keeping score is the point, and so far the score is
-mixed.
-
-| prediction | status | where |
-|---|---|---|
-| Decode is bandwidth bound at low batch, ceiling 194 tok/s | **falsified.** Measured 45.80 tok/s, 4.2x below that ceiling. Bandwidth is not what binds; the host is | Part 2 |
-| Prefill is compute bound and decode is bandwidth bound, so they need separate reporting | **confirmed as a shape.** The two sit on opposite sides of the roofline: at 4096 tokens the naive engine reaches 36.3% of peak compute and 1.9% of peak bandwidth, the cached one 1.8% and 24.5% | Part 2 |
-| A cache should buy nothing at short prompts and a lot at long ones | **confirmed.** 0.96x at 16 tokens, 12.73x at 4096 | Part 2 |
-| Cached decode should land at ~52 tok/s, flat | **missed low, five times out of five.** Measured 44 to 46 tok/s, 12 to 15% under, for a reason Part 2 explains | Part 2 |
-| Batch 208 is where decode stops being bandwidth bound | untested | needs a batch sweep |
-| Cache traffic overtakes weight traffic at batch 32 and 4096 tokens | untested | needs a batch sweep |
+[Where each of these comes from](docs/arithmetic.md).
 
 ## The workload
 
-Every part runs the same five prompts, sliced to exact token counts from one
+Every part runs the same five prompts, cut to exact token counts from one
 source text: **16, 64, 256, 1024 and 4096 tokens**. They are exact rather than
 approximate, so prompt length is a clean 4x geometric axis and a curve drawn
-against it means something. Prompts are named after their length, so `p4096` is
-the 4096 token one.
+against it can be laid over the curve from another part. Prompts are named
+after their length, so p4096 is the 4096 token one.
 
-Each run generates **256 new tokens**, greedy, from a fixed seed, so the output
-is deterministic and any two engines can be checked for producing identical
-text. Every number reported in a part is the mean or median of **five recorded
-runs after two warmup runs**, at batch size 1.
+Each run generates **256 new tokens**, greedy, from a fixed seed. The output is
+deterministic, so any two engines can be checked for producing identical text.
+Every number reported in a part is the mean or median of **five recorded runs
+after two warmup runs**, at batch size 1.
 
-Two numbers get reported separately in every part, because they measure
-different phases. **Time to first token** is prefill: the cost of processing the
-prompt. **Inter token latency** is decode: the cost of each token after that.
-Averaging them together would hide both.
+## The only variable
+
+The model, the card, the prompts, the sampling and the run counts are fixed
+and stay fixed. The engine is the only thing that changes from one part to the
+next to ensure that every measurement reflects only the effect of that engine change.
+
+## Code
+
+```
+infer/      the engines, the decode loop, the benchmark harness
+scripts/    analysis, roofline and plotting
+results/    one directory per part: writeup, figures, raw runs
+docs/       the hardware and arithmetic appendices
+```
+
+Running a part:
+
+```
+uv run modal run modal_app.py --engine naive
+uv run modal run modal_app.py --engine cached
+```
+
+Every recorded run is in `results/<engine>/runs.jsonl` and `runs.csv`, one row
+per run. The exact flags for each part are in its own **Reproducing this**
+section.
